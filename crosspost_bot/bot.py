@@ -11,13 +11,19 @@ from vk_api.upload import VkUpload
 from io import BytesIO
 from flask import Flask, request
 import threading
+import asyncio
+import signal
+import sys
 
 # Загружаем переменные окружения
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 VK_TOKEN = os.getenv('VK_TOKEN')
 DATABASE_URL = os.getenv('DATABASE_URL')
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 # Создаем Flask приложение для health checks
@@ -54,6 +60,9 @@ class AdminControlledReplyBot:
         self.vk_api = None
         self.vk_upload = None
         self.init_vk_api()
+        
+        # Флаг для graceful shutdown
+        self.is_running = True
     
     def get_db_connection(self):
         """Получаем соединение с PostgreSQL"""
@@ -1177,7 +1186,7 @@ class AdminControlledReplyBot:
         await update.message.reply_text(
             "👑 **Добавление администратора**\n\n"
             "Введите Telegram ID пользователя (только цифры):\n\n"
-            "❌ Для отмена нажмите кнопку ниже",
+            "❌ Для отмены нажмите кнопку ниже",
             reply_markup=reply_markup
         )
 
@@ -1338,16 +1347,17 @@ class AdminControlledReplyBot:
         
         await update.message.reply_text(self.get_vk_token_message())
     
-    def run_with_retry(self, max_retries=3, initial_delay=10):
-        """Запуск бота с повторными попытками при конфликте"""
+    async def run_bot(self):
+        """Запуск бота с обработкой graceful shutdown"""
         retries = 0
-        delay = initial_delay
+        max_retries = 3
+        initial_delay = 10
         
-        while retries < max_retries:
+        while retries < max_retries and self.is_running:
             try:
                 logger.info(f"🚀 Запуск бота на Render.com (попытка {retries + 1}/{max_retries})...")
                 
-                self.tg_app.run_polling(
+                await self.tg_app.run_polling(
                     drop_pending_updates=True,
                     allowed_updates=None,
                     close_loop=False
@@ -1359,35 +1369,60 @@ class AdminControlledReplyBot:
                 error_msg = str(e)
                 
                 if "Conflict" in error_msg or "terminated by other getUpdates" in error_msg:
-                    logger.warning(f"🔄 Конфликт обнаружен, повтор через {delay} сек...")
-                    time.sleep(delay)
-                    delay *= 2
+                    logger.warning(f"🔄 Конфликт обнаружен, повтор через {initial_delay} сек...")
+                    await asyncio.sleep(initial_delay)
+                    initial_delay *= 2
                 else:
                     logger.error(f"❌ Критическая ошибка: {error_msg}")
-                    break
-                
-                if retries >= max_retries:
-                    logger.error("❌ Достигнут лимит попыток запуска")
-                    break
+                    if retries < max_retries:
+                        logger.info(f"🔄 Перезапуск через {initial_delay} сек...")
+                        await asyncio.sleep(initial_delay)
+                        initial_delay *= 2
+                    else:
+                        logger.error("❌ Достигнут лимит попыток запуска")
+                        break
+    
+    def stop(self):
+        """Остановка бота"""
+        self.is_running = False
+        logger.info("🛑 Остановка бота...")
 
 def run_flask_app():
     """Запуск Flask приложения для health checks"""
     port = int(os.environ.get('PORT', 10000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+    logger.info(f"🌐 Запуск Flask сервера на порту {port}")
+    app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
 
-if __name__ == "__main__":
-    # Запускаем Flask в отдельном потоке
-    flask_thread = threading.Thread(target=run_flask_app, daemon=True)
+def signal_handler(signum, frame):
+    """Обработчик сигналов для graceful shutdown"""
+    logger.info(f"📞 Получен сигнал {signum}, завершаем работу...")
+    if 'bot' in globals():
+        globals()['bot'].stop()
+    sys.exit(0)
+
+async def main():
+    """Основная функция запуска"""
+    # Регистрируем обработчики сигналов
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    # Запускаем Flask в отдельном потоке (не демон)
+    flask_thread = threading.Thread(target=run_flask_app)
+    flask_thread.daemon = True
     flask_thread.start()
     
     logger.info("🚀 Flask сервер запущен для health checks")
     
     # Даем время завершиться предыдущему процессу
-    time.sleep(5)
+    await asyncio.sleep(5)
     
     try:
+        global bot
         bot = AdminControlledReplyBot()
         logger.info("🤖 Бот инициализирован, запускаем polling...")
-        bot.run_with_retry(max_retries=3, initial_delay=10)
+        await bot.run_bot()
     except Exception as e:
         logger.error(f"❌ Критическая ошибка при запуске бота: {e}")
+
+if __name__ == "__main__":
+    asyncio.run(main())
