@@ -1,6 +1,7 @@
 import logging
 import sqlite3
 import re
+import os
 from urllib.parse import unquote
 from telegram import Update, InputFile, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -8,7 +9,13 @@ from vk_api import VkApi
 from vk_api.upload import VkUpload
 from io import BytesIO
 
-from config import TELEGRAM_TOKEN, VK_TOKEN
+# Загружаем .env только если не на Render
+if not os.getenv('RENDER'):
+    from dotenv import load_dotenv
+    load_dotenv()
+
+TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
+VK_TOKEN = os.getenv('VK_TOKEN')
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -46,194 +53,6 @@ class AdminControlledReplyBot:
             logger.error(f"❌ Ошибка VK API: {e}")
             self.vk_api = None
             self.vk_upload = None
-    
-    def check_vk_token(self):
-        """Проверка валидности VK токена"""
-        if not self.vk_api:
-            return False
-        
-        try:
-            # Пробуем безопасный метод для проверки токена
-            self.vk_api.users.get()
-            return True
-        except Exception as e:
-            logger.error(f"VK токен невалиден: {e}")
-            return False
-    
-    def get_vk_token_message(self):
-        """Сообщение с инструкцией по получению нового токена"""
-        token_message = (
-            "🔑 **VK токен истек или невалиден!**\n\n"
-            "Чтобы получить новый токен:\n\n"
-            "1. **Перейди по ссылке:**\n"
-            "https://oauth.vk.com/authorize?client_id=6121396&scope=photos,groups,wall,offline&redirect_uri=https://oauth.vk.com/blank.html&display=page&v=5.199&response_type=token\n\n"
-            "2. **Скопируй токен из адресной строки** (часть между `access_token=` и `&expires_in`)\n\n"
-            "3. **Обнови токен командой:**\n"
-            "`/update_token твой_новый_токен`\n\n"
-            "**Или просто отправь ссылку из адресной строки** - бот автоматически извлечет токен!\n\n"
-            "📎 **Ссылка для копирования:**\n"
-            "`https://oauth.vk.com/authorize?client_id=6121396&scope=photos,groups,wall,offline&redirect_uri=https://oauth.vk.com/blank.html&display=page&v=5.199&response_type=token`"
-        )
-        return token_message
-    
-    def extract_token_from_input(self, input_text: str) -> str:
-        """Извлекает токен из различных форматов ввода"""
-        # Если это URL с токеном
-        if 'access_token=' in input_text:
-            # Декодируем URL
-            decoded_url = unquote(input_text)
-            
-            # Ищем токен в URL - ВСЕ символы до следующего параметра (&)
-            token_match = re.search(r'access_token=([^&]+)', decoded_url)
-            if token_match:
-                return token_match.group(1)
-        
-        # Если это прямая ссылка на oauth.vk.com
-        elif 'oauth.vk.com' in input_text:
-            # Пробуем извлечь из фрагмента URL
-            fragment_match = re.search(r'#(.+)', input_text)
-            if fragment_match:
-                fragment = fragment_match.group(1)
-                token_match = re.search(r'access_token=([^&]+)', fragment)
-                if token_match:
-                    return token_match.group(1)
-        
-        # Если это просто токен (может содержать буквы, цифры, точки, дефисы, подчеркивания)
-        elif re.match(r'^[a-zA-Z0-9\.\-_]+$', input_text.strip()):
-            return input_text.strip()
-        
-        return None
-    
-    def update_vk_token(self, new_token: str) -> bool:
-        """Обновляет VK токен в памяти и в файле .env"""
-        try:
-            # Обновляем в памяти
-            global VK_TOKEN
-            VK_TOKEN = new_token
-            
-            # Переинициализируем VK API
-            self.init_vk_api()
-            
-            # Обновляем в файле .env
-            self.update_env_file(new_token)
-            
-            logger.info("✅ VK токен успешно обновлен")
-            return True
-            
-        except Exception as e:
-            logger.error(f"❌ Ошибка обновления токена: {e}")
-            return False
-    
-    def update_env_file(self, new_token: str):
-        """Обновляет токен в файле .env"""
-        try:
-            # Читаем текущий файл
-            with open('.env', 'r', encoding='utf-8') as file:
-                lines = file.readlines()
-            
-            # Обновляем или добавляем VK_TOKEN
-            token_updated = False
-            new_lines = []
-            
-            for line in lines:
-                if line.startswith('VK_TOKEN='):
-                    new_lines.append(f'VK_TOKEN={new_token}\n')
-                    token_updated = True
-                else:
-                    new_lines.append(line)
-            
-            # Если токен не был найден, добавляем новую строку
-            if not token_updated:
-                new_lines.append(f'VK_TOKEN={new_token}\n')
-            
-            # Записываем обратно
-            with open('.env', 'w', encoding='utf-8') as file:
-                file.writelines(new_lines)
-                
-            logger.info("✅ Файл .env обновлен")
-            
-        except Exception as e:
-            logger.error(f"❌ Ошибка обновления .env файла: {e}")
-            raise
-    
-    async def update_token_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Команда для обновления VK токена через ссылку"""
-        user = update.effective_user
-        user_info = self.get_user(user.id)
-        
-        if not user_info or not user_info['is_admin']:
-            await update.message.reply_text("❌ Эта команда только для администраторов")
-            return
-        
-        # Проверяем, есть ли ссылка в сообщении
-        if not context.args:
-            await update.message.reply_text(
-                "🔧 **Обновление VK токена**\n\n"
-                "Отправьте команду в формате:\n"
-                "`/update_token https://oauth.vk.com/blank.html#access_token=ваш_токен&expires_in=...`\n\n"
-                "Или просто отправьте новый токен:\n"
-                "`/update_token ваш_новый_токен`\n\n"
-                "Также можно просто отправить ссылку в чат - бот автоматически распознает токен!"
-            )
-            return
-        
-        token_input = ' '.join(context.args)
-        new_token = self.extract_token_from_input(token_input)
-        
-        if not new_token:
-            await update.message.reply_text(
-                "❌ Не удалось извлечь токен из ссылки.\n\n"
-                "Проверьте формат:\n"
-                "• Ссылка должна содержать `access_token=...`\n"
-                "• Или отправьте только токен\n"
-                f"Полученный ввод: {token_input[:100]}..."
-            )
-            return
-        
-        # Обновляем токен
-        if self.update_vk_token(new_token):
-            await update.message.reply_text(
-                f"✅ VK токен успешно обновлен!\n\n"
-                f"Токен: `{new_token[:15]}...{new_token[-10:]}`\n"
-                f"Длина токена: {len(new_token)} символов\n\n"
-                f"Статус VK: {'✅ Работает' if self.check_vk_token() else '❌ Ошибка'}\n\n"
-                f"Проверьте статус: /status"
-            )
-        else:
-            await update.message.reply_text("❌ Ошибка при обновлении токена")
-    
-    async def handle_token_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработка сообщений с токенами (автоматическое определение)"""
-        user = update.effective_user
-        user_info = self.get_user(user.id)
-        
-        if not user_info or not user_info['is_admin']:
-            return
-        
-        text = update.message.text
-        
-        # Проверяем, содержит ли сообщение токен VK
-        if any(keyword in text for keyword in ['access_token=', 'oauth.vk.com']):
-            new_token = self.extract_token_from_input(text)
-            
-            if new_token:
-                if self.update_vk_token(new_token):
-                    await update.message.reply_text(
-                        f"✅ VK токен автоматически обновлен!\n\n"
-                        f"Токен: `{new_token[:15]}...{new_token[-10:]}`\n"
-                        f"Длина токена: {len(new_token)} символов\n\n"
-                        f"Статус VK: {'✅ Работает' if self.check_vk_token() else '❌ Ошибка'}\n\n"
-                        f"Проверьте статус: /status"
-                    )
-                else:
-                    await update.message.reply_text("❌ Ошибка при автоматическом обновлении токена")
-    
-    async def handle_text_message_with_token(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Объединенный обработчик текстовых сообщений"""
-        # Сначала проверяем токен
-        await self.handle_token_message(update, context)
-        # Затем стандартная обработка
-        await self.handle_text_message(update, context)
     
     def init_database(self):
         """Инициализация базы данных"""
@@ -440,26 +259,140 @@ class AdminControlledReplyBot:
             'vk_group_id': channel[3]
         } for channel in channels]
     
-    async def status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Показать статус подключений"""
-        vk_status = "✅ Работает" if self.check_vk_token() else "❌ Истек/Невалиден"
-        tg_status = "✅ Работает"
+    def check_vk_token(self):
+        """Проверка валидности VK токена"""
+        if not self.vk_api:
+            return False
         
-        message = (
-            f"📊 **Статус бота:**\n\n"
-            f"Telegram API: {tg_status}\n"
-            f"VK API: {vk_status}\n\n"
+        try:
+            # Пробуем безопасный метод для проверки токена
+            self.vk_api.users.get()
+            return True
+        except Exception as e:
+            logger.error(f"VK токен невалиден: {e}")
+            return False
+    
+    def get_vk_token_message(self):
+        """Сообщение с инструкцией по получению нового токена"""
+        is_render = os.getenv('RENDER')
+        platform_info = "🚀 **Render.com**" if is_render else "💻 **Локальный сервер**"
+        
+        token_message = (
+            f"🔑 **VK токен истек или невалиден!**\n\n"
+            f"Платформа: {platform_info}\n\n"
+            "Чтобы получить новый токен:\n\n"
+            "1. **Перейди по ссылке:**\n"
+            "https://oauth.vk.com/authorize?client_id=6121396&scope=photos,groups,wall,offline&redirect_uri=https://oauth.vk.com/blank.html&display=page&v=5.199&response_type=token\n\n"
+            "2. **Скопируй токен из адресной строки** (часть между `access_token=` и `&expires_in`)\n\n"
         )
         
-        if not self.check_vk_token():
-            message += self.get_vk_token_message()
+        if is_render:
+            token_message += (
+                "3. **Обнови токен командой:**\n"
+                "`/update_token ваш_новый_токен`\n\n"
+                "**Или просто отправь ссылку из адресной строки** - бот автоматически извлечет токен!\n\n"
+                "⚠️ **На Render.com токен обновляется только в памяти бота!**\n"
+                "После перезапуска сервиса нужно будет обновить токен снова.\n\n"
+                "Для постоянного хранения токена обновите переменную окружения в Dashboard Render."
+            )
         else:
-            message += "Все системы работают нормально! 🚀"
+            token_message += (
+                "3. **Обнови токен командой:**\n"
+                "`/update_token ваш_новый_токен`\n\n"
+                "**Или просто отправь ссылку из адресной строки** - бот автоматически извлечет токен!\n\n"
+                "Токен будет сохранен в файле .env"
+            )
         
-        await update.message.reply_text(message)
+        token_message += "\n\n📎 **Ссылка для копирования:**\n"
+        token_message += "`https://oauth.vk.com/authorize?client_id=6121396&scope=photos,groups,wall,offline&redirect_uri=https://oauth.vk.com/blank.html&display=page&v=5.199&response_type=token`"
+        
+        return token_message
     
-    async def get_token_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Команда для получения ссылки на новый токен"""
+    def extract_token_from_input(self, input_text: str) -> str:
+        """Извлекает токен из различных форматов ввода"""
+        # Если это URL с токеном
+        if 'access_token=' in input_text:
+            # Декодируем URL
+            decoded_url = unquote(input_text)
+            
+            # Ищем токен в URL - ВСЕ символы до следующего параметра (&)
+            token_match = re.search(r'access_token=([^&]+)', decoded_url)
+            if token_match:
+                return token_match.group(1)
+        
+        # Если это прямая ссылка на oauth.vk.com
+        elif 'oauth.vk.com' in input_text:
+            # Пробуем извлечь из фрагмента URL
+            fragment_match = re.search(r'#(.+)', input_text)
+            if fragment_match:
+                fragment = fragment_match.group(1)
+                token_match = re.search(r'access_token=([^&]+)', fragment)
+                if token_match:
+                    return token_match.group(1)
+        
+        # Если это просто токен (может содержать буквы, цифры, точки, дефисы, подчеркивания)
+        elif re.match(r'^[a-zA-Z0-9\.\-_]+$', input_text.strip()):
+            return input_text.strip()
+        
+        return None
+    
+    def update_vk_token(self, new_token: str) -> bool:
+        """Обновляет VK токен в памяти и в файле .env (только если не на Render)"""
+        try:
+            # Обновляем глобальную переменную
+            global VK_TOKEN
+            VK_TOKEN = new_token
+            
+            # Переинициализируем VK API
+            self.init_vk_api()
+            
+            # Обновляем в файле .env только если не на Render
+            if not os.getenv('RENDER'):
+                self.update_env_file(new_token)
+                logger.info("✅ VK токен обновлен в памяти и в .env файле")
+            else:
+                logger.info("✅ VK токен обновлен в памяти (Render.com)")
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка обновления токена: {e}")
+            return False
+    
+    def update_env_file(self, new_token: str):
+        """Обновляет токен в файле .env (только для локального использования)"""
+        try:
+            # Читаем текущий файл
+            with open('.env', 'r', encoding='utf-8') as file:
+                lines = file.readlines()
+            
+            # Обновляем или добавляем VK_TOKEN
+            token_updated = False
+            new_lines = []
+            
+            for line in lines:
+                if line.startswith('VK_TOKEN='):
+                    new_lines.append(f'VK_TOKEN={new_token}\n')
+                    token_updated = True
+                else:
+                    new_lines.append(line)
+            
+            # Если токен не был найден, добавляем новую строку
+            if not token_updated:
+                new_lines.append(f'VK_TOKEN={new_token}\n')
+            
+            # Записываем обратно
+            with open('.env', 'w', encoding='utf-8') as file:
+                file.writelines(new_lines)
+                
+            logger.info("✅ Файл .env обновлен")
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка обновления .env файла: {e}")
+            raise
+    
+    async def update_token_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Команда для обновления VK токена через ссылку"""
         user = update.effective_user
         user_info = self.get_user(user.id)
         
@@ -467,8 +400,116 @@ class AdminControlledReplyBot:
             await update.message.reply_text("❌ Эта команда только для администраторов")
             return
         
-        await update.message.reply_text(self.get_vk_token_message())
+        # Проверяем, есть ли ссылка в сообщении
+        if not context.args:
+            is_render = os.getenv('RENDER')
+            platform_info = "Render.com" if is_render else "локальном сервере"
+            
+            message = (
+                f"🔧 **Обновление VK токена**\n\n"
+                f"Платформа: {platform_info}\n\n"
+                "Отправьте команду в формате:\n"
+                "`/update_token https://oauth.vk.com/blank.html#access_token=ваш_токен&expires_in=...`\n\n"
+                "Или просто отправьте новый токен:\n"
+                "`/update_token ваш_новый_токен`\n\n"
+                "Также можно просто отправить ссылку в чат - бот автоматически распознает токен!\n\n"
+            )
+            
+            if is_render:
+                message += (
+                    "⚠️ **Внимание:** На Render.com токен обновляется только в памяти бота.\n"
+                    "После перезапуска сервиса потребуется обновить токен снова.\n\n"
+                    "Для постоянного хранения обновите переменную окружения в Dashboard Render."
+                )
+            
+            await update.message.reply_text(message)
+            return
+        
+        token_input = ' '.join(context.args)
+        new_token = self.extract_token_from_input(token_input)
+        
+        if not new_token:
+            await update.message.reply_text(
+                "❌ Не удалось извлечь токен из ссылки.\n\n"
+                "Проверьте формат:\n"
+                "• Ссылка должна содержать `access_token=...`\n"
+                "• Или отправьте только токен\n"
+                f"Полученный ввод: {token_input[:100]}..."
+            )
+            return
+        
+        # Обновляем токен
+        if self.update_vk_token(new_token):
+            is_render = os.getenv('RENDER')
+            
+            message = (
+                f"✅ VK токен успешно обновлен!\n\n"
+                f"Токен: `{new_token[:15]}...{new_token[-10:]}`\n"
+                f"Длина токена: {len(new_token)} символов\n\n"
+                f"Статус VK: {'✅ Работает' if self.check_vk_token() else '❌ Ошибка'}\n\n"
+            )
+            
+            if is_render:
+                message += (
+                    "⚠️ **Токен обновлен только в памяти бота**\n"
+                    "После перезапуска сервиса на Render.com потребуется обновить токен снова.\n\n"
+                    "Для постоянного хранения обновите переменную `VK_TOKEN` в Dashboard Render.\n\n"
+                )
+            else:
+                message += "✅ Токен сохранен в файл .env\n\n"
+            
+            message += "Проверьте статус: /status"
+            
+            await update.message.reply_text(message)
+        else:
+            await update.message.reply_text("❌ Ошибка при обновлении токена")
     
+    async def handle_token_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработка сообщений с токенами (автоматическое определение)"""
+        user = update.effective_user
+        user_info = self.get_user(user.id)
+        
+        if not user_info or not user_info['is_admin']:
+            return
+        
+        text = update.message.text
+        
+        # Проверяем, содержит ли сообщение токен VK
+        if any(keyword in text for keyword in ['access_token=', 'oauth.vk.com']):
+            new_token = self.extract_token_from_input(text)
+            
+            if new_token:
+                if self.update_vk_token(new_token):
+                    is_render = os.getenv('RENDER')
+                    
+                    message = (
+                        f"✅ VK токен автоматически обновлен!\n\n"
+                        f"Токен: `{new_token[:15]}...{new_token[-10:]}`\n"
+                        f"Длина токена: {len(new_token)} символов\n\n"
+                        f"Статус VK: {'✅ Работает' if self.check_vk_token() else '❌ Ошибка'}\n\n"
+                    )
+                    
+                    if is_render:
+                        message += (
+                            "⚠️ **Токен обновлен только в памяти бота**\n"
+                            "После перезапуска сервиса потребуется обновить токен снова.\n\n"
+                        )
+                    else:
+                        message += "✅ Токен сохранен в файл .env\n\n"
+                    
+                    message += "Проверьте статус: /status"
+                    
+                    await update.message.reply_text(message)
+                else:
+                    await update.message.reply_text("❌ Ошибка при автоматическом обновлении токена")
+
+    async def handle_text_message_with_token(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Объединенный обработчик текстовых сообщений"""
+        # Сначала проверяем токен
+        await self.handle_token_message(update, context)
+        # Затем стандартная обработка
+        await self.handle_text_message(update, context)
+
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Регистрация/приветствие пользователя"""
         user = update.effective_user
@@ -520,9 +561,12 @@ class AdminControlledReplyBot:
         
         role_text = "👑 Администратор" if user_info['is_admin'] else "👤 Пользователь"
         vk_status = "✅" if self.check_vk_token() else "❌"
+        is_render = os.getenv('RENDER')
+        platform_info = "🚀 Render.com" if is_render else "💻 Локальный"
         
         message = (
             f"🎯 **Главное меню**\n\n"
+            f"Платформа: {platform_info}\n"
             f"Роль: {role_text}\n"
             f"Имя: {user_info['first_name']}\n"
             f"VK: {vk_status}\n\n"
@@ -1042,8 +1086,45 @@ class AdminControlledReplyBot:
             reply_markup=reply_markup
         )
     
+    async def status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Показать статус подключений"""
+        vk_status = "✅ Работает" if self.check_vk_token() else "❌ Истек/Невалиден"
+        tg_status = "✅ Работает"
+        is_render = os.getenv('RENDER')
+        platform = "🚀 Render.com" if is_render else "💻 Локальный сервер"
+        
+        message = (
+            f"📊 **Статус бота**\n\n"
+            f"Платформа: {platform}\n"
+            f"Telegram API: {tg_status}\n"
+            f"VK API: {vk_status}\n\n"
+        )
+        
+        if not self.check_vk_token():
+            message += self.get_vk_token_message()
+        else:
+            message += "Все системы работают нормально! 🚀"
+            
+            if is_render:
+                message += "\n\n⚠️ **На Render.com токен хранится в памяти**\nПри перезапуске сервиса потребуется обновить токен снова."
+
+        await update.message.reply_text(message)
+    
+    async def get_token_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Команда для получения ссылки на новый токен"""
+        user = update.effective_user
+        user_info = self.get_user(user.id)
+        
+        if not user_info or not user_info['is_admin']:
+            await update.message.reply_text("❌ Эта команда только для администраторов")
+            return
+        
+        await update.message.reply_text(self.get_vk_token_message())
+    
     def run(self):
-        logger.info("Бот с Reply Keyboard и контролем доступа запущен...")
+        is_render = os.getenv('RENDER')
+        platform = "Render.com" if is_render else "локальном сервере"
+        logger.info(f"Бот запущен на {platform}...")
         self.tg_app.run_polling()
 
 if __name__ == "__main__":
