@@ -469,15 +469,16 @@ class AdminControlledReplyBot:
             # Меню для администратора
             keyboard = [
                 ["📢 Опубликовать пост", "📋 Мои каналы"],
-                ["👥 Управление пользователями", "⚙️ Управление каналами"],
-                ["👑 Управление админами", "ℹ️ Помощь"],
-                ["❌ Скрыть меню"]
+                ["🆕 Новые каналы", "👥 Управление пользователями"],  # ДОБАВЛЕНО
+                ["⚙️ Управление каналами", "👑 Управление админами"],
+                ["ℹ️ Помощь", "❌ Скрыть меню"]
             ]
         else:
             # Меню для обычного пользователя
             keyboard = [
                 ["📢 Опубликовать пост", "📋 Мои каналы"],
-                ["ℹ️ Помощь", "❌ Скрыть меню"]
+                ["🆕 Новые каналы", "ℹ️ Помощь"],  # ДОБАВЛЕНО
+                ["❌ Скрыть меню"]
             ]
         
         reply_markup = ReplyKeyboardMarkup(
@@ -528,6 +529,9 @@ class AdminControlledReplyBot:
         elif text == "📋 Мои каналы":
             await self.show_my_channels(update, context)
         
+        elif text == "🆕 Новые каналы":  # НОВАЯ КНОПКА
+            await self.show_new_channels(update, context)
+        
         elif text == "👥 Управление пользователями" and user_info['is_admin']:
             await self.show_user_management(update, context)
         
@@ -552,6 +556,9 @@ class AdminControlledReplyBot:
         elif text == "🔙 Назад в меню":
             await self.show_main_menu(update, context)
         
+        elif text == "❌ Отменить добавление":  # НОВАЯ КНОПКА
+            await self.cancel_setup(update, context)
+        
         elif text == "✅ Одобрить всех пользователей" and user_info['is_admin']:
             await self.approve_all_users(update, context)
         
@@ -575,7 +582,7 @@ class AdminControlledReplyBot:
             await update.message.reply_text(
                 "ℹ️ Используйте меню для навигации или /menu для показа меню"
             )
-    
+
     async def show_publish_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Меню публикации"""
         user = update.effective_user
@@ -731,21 +738,22 @@ class AdminControlledReplyBot:
         """Начало процесса добавления канала"""
         context.user_data['setup_stage'] = 'awaiting_name'
         
-        keyboard = [["🔙 Назад в меню"]]
+        keyboard = [["❌ Отменить добавление"]]  # ИЗМЕНЕНО
         reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
         
         await update.message.reply_text(
             "📝 **Добавление нового канала**\n\n"
-            "Шаг 1/3: Введите название канала (например: 'Новости компании'):",
+            "Шаг 1/3: Введите название канала (например: 'Новости компании'):\n\n"
+            "❌ Для отмены нажмите кнопку ниже",  # ДОБАВЛЕНО
             reply_markup=reply_markup
         )
-    
+
     async def handle_channel_setup(self, update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
         """Обработка процесса добавления канала"""
         user_data = context.user_data
         stage = user_data['setup_stage']
         
-        keyboard = [["🔙 Назад в меню"]]
+        keyboard = [["❌ Отменить добавление"]]  # ИЗМЕНЕНО
         reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
         
         if stage == 'awaiting_name':
@@ -753,7 +761,8 @@ class AdminControlledReplyBot:
             user_data['setup_stage'] = 'awaiting_telegram'
             await update.message.reply_text(
                 "✅ Название сохранено!\n\n"
-                "Шаг 2/3: Введите username Telegram канала (например: @my_channel):",
+                "Шаг 2/3: Введите username Telegram канала (например: @my_channel):\n\n"
+                "❌ Для отмены нажмите кнопку ниже",  # ДОБАВЛЕНО
                 reply_markup=reply_markup
             )
             
@@ -762,7 +771,8 @@ class AdminControlledReplyBot:
             user_data['setup_stage'] = 'awaiting_vk'
             await update.message.reply_text(
                 "✅ Telegram канал сохранен!\n\n"
-                "Шаг 3/3: Введите ID VK группы (например: -123456789):",
+                "Шаг 3/3: Введите ID VK группы (например: -123456789):\n\n"
+                "❌ Для отмены нажмите кнопку ниже",  # ДОБАВЛЕНО
                 reply_markup=reply_markup
             )
             
@@ -792,9 +802,14 @@ class AdminControlledReplyBot:
                     # Очищаем временные данные
                     context.user_data.clear()
                     
+                    # Показываем главное меню после успешного добавления
+                    keyboard = [["🆕 Новые каналы", "📢 Опубликовать пост"], ["🔙 Назад в меню"]]  # ДОБАВЛЕНО
+                    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+                    
                     await update.message.reply_text(
                         f"🎉 Канал '{user_data['new_channel_name']}' успешно добавлен!\n\n"
-                        "Все одобренные пользователи автоматически получили доступ к этому каналу.",
+                        "✅ Все одобренные пользователи автоматически получили доступ к этому каналу.\n\n"
+                        "📢 Вы можете сразу начать публикацию или посмотреть новые каналы:",
                         reply_markup=reply_markup
                     )
                 else:
@@ -826,14 +841,14 @@ class AdminControlledReplyBot:
         else:
             message += "\n"
         
-        message += "🎯 **Как опубликовать пост:**\n"
-        message += "1. Нажмите '📢 Опубликовать пост'\n"
-        message += "2. Выберите канал из списка\n"
-        message += "3. Отправьте текст или фото\n"
-        message += "4. Пост автоматически опубликуется в Telegram и VK\n\n"
+        message += "🎯 **Основные функции:**\n"
+        message += "• '📢 Опубликовать пост' - выбрать канал и опубликовать контент\n"
+        message += "• '📋 Мои каналы' - список всех доступных каналов\n"
+        message += "• '🆕 Новые каналы' - показать последние добавленные каналы\n\n"  # ДОБАВЛЕНО
         
-        message += "📱 **Просмотр каналов:**\n"
-        message += "• '📋 Мои каналы' - список доступных вам каналов\n\n"
+        message += "❌ **Отмена действий:**\n"
+        message += "• Во время добавления канала используйте '❌ Отменить добавление'\n"
+        message += "• При выборе канала для публикации - '🔙 Назад в меню'\n\n"
         
         if user_info['is_admin']:
             message += "👥 **Функции администратора:**\n"
@@ -1071,6 +1086,57 @@ class AdminControlledReplyBot:
                 if retries >= max_retries:
                     logger.error("❌ Достигнут лимит попыток запуска")
                     break
+
+    async def cancel_setup(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отмена процесса добавления канала"""
+    if 'setup_stage' in context.user_data:
+        context.user_data.clear()
+        await update.message.reply_text(
+            "❌ Процесс добавления канала отменен.",
+            reply_markup=ReplyKeyboardRemove()
+        )
+        await self.show_main_menu(update, context)
+    else:
+        await update.message.reply_text("❌ Нет активного процесса для отмены.")
+
+
+    async def show_new_channels(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Показать новые каналы, к которым пользователь получил доступ"""
+        user = update.effective_user
+        user_info = self.get_user(user.id)
+        
+        if not user_info or not user_info['is_approved']:
+            await update.message.reply_text("❌ Доступ запрещен. Ожидайте одобрения администратора.")
+            return
+        
+        # Получаем каналы, к которым пользователь получил доступ недавно
+        query = """
+            SELECT c.name, c.telegram_channel, c.vk_group_id, c.created_at 
+            FROM channels c
+            JOIN user_permissions up ON c.id = up.channel_id
+            WHERE up.user_id = %s AND c.is_active = TRUE
+            ORDER BY c.created_at DESC
+            LIMIT 5
+        """
+        result = self.execute_query(query, (user_info['id'],))
+        
+        if not result:
+            message = "📭 У вас пока нет доступных каналов.\n\nОжидайте одобрения администратора или обратитесь к нему для получения доступа."
+        else:
+            message = "🆕 **Последние добавленные каналы:**\n\n"
+            for channel in result:
+                message += f"• **{channel[0]}**\n"
+                message += f"  📱 TG: {channel[1]}\n"
+                message += f"  👥 VK: {channel[2]}\n"
+                message += f"  📅 Добавлен: {channel[3].strftime('%d.%m.%Y')}\n\n"
+            
+            message += "Для публикации используйте меню: 📢 Опубликовать пост"
+        
+        keyboard = [["🔙 Назад в меню"]]
+        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+        
+        await update.message.reply_text(message, reply_markup=reply_markup)
+
 
 if __name__ == "__main__":
     # Даем время завершиться предыдущему процессу
