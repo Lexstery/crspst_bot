@@ -2,7 +2,6 @@ import logging
 import os
 import re
 from urllib.parse import unquote
-import psycopg
 from telegram import Update, InputFile, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from vk_api import VkApi
@@ -36,11 +35,22 @@ class AdminControlledReplyBot:
         """Получаем соединение с базой данных"""
         if DATABASE_URL:
             # PostgreSQL на Render
-            conn = psycopg.connect(DATABASE_URL, sslmode='require')
+            try:
+                import psycopg
+                conn = psycopg.connect(DATABASE_URL)
+                self.db_type = 'postgresql'
+                return conn
+            except ImportError:
+                logger.error("psycopg не установлен, используем SQLite")
+        
+        # Локально SQLite (для разработки)
+        import sqlite3
+        if os.getenv('RENDER'):
+            db_path = '/tmp/bot.db'
         else:
-            # Локально SQLite (для разработки)
-            import sqlite3
-            conn = sqlite3.connect('bot.db')
+            db_path = 'bot.db'
+        conn = sqlite3.connect(db_path)
+        self.db_type = 'sqlite'
         return conn
     
     def setup_handlers(self):
@@ -67,114 +77,168 @@ class AdminControlledReplyBot:
             self.vk_upload = None
     
     def init_database(self):
-        """Инициализация базы данных PostgreSQL"""
+        """Инициализация базы данных"""
         conn = self.get_db_connection()
         cursor = conn.cursor()
         
         try:
-            # Таблица пользователей с approved статусом
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS users (
-                    id SERIAL PRIMARY KEY,
-                    telegram_id BIGINT UNIQUE NOT NULL,
-                    username TEXT,
-                    first_name TEXT,
-                    is_admin BOOLEAN DEFAULT FALSE,
-                    is_approved BOOLEAN DEFAULT FALSE,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            if self.db_type == 'postgresql':
+                # PostgreSQL синтаксис
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS users (
+                        id SERIAL PRIMARY KEY,
+                        telegram_id BIGINT UNIQUE NOT NULL,
+                        username TEXT,
+                        first_name TEXT,
+                        is_admin BOOLEAN DEFAULT FALSE,
+                        is_approved BOOLEAN DEFAULT FALSE,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                ''')
+                
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS channels (
+                        id SERIAL PRIMARY KEY,
+                        name TEXT NOT NULL,
+                        telegram_channel TEXT NOT NULL,
+                        vk_group_id TEXT NOT NULL,
+                        created_by INTEGER,
+                        is_active BOOLEAN DEFAULT TRUE,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        FOREIGN KEY (created_by) REFERENCES users (id)
+                    )
+                ''')
+                
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS user_permissions (
+                        user_id INTEGER,
+                        channel_id INTEGER,
+                        can_post BOOLEAN DEFAULT TRUE,
+                        PRIMARY KEY (user_id, channel_id),
+                        FOREIGN KEY (user_id) REFERENCES users (id),
+                        FOREIGN KEY (channel_id) REFERENCES channels (id)
+                    )
+                ''')
+                
+                # Добавляем первого пользователя как администратора
+                cursor.execute(
+                    "INSERT INTO users (telegram_id, username, first_name, is_admin, is_approved) VALUES (%s, %s, %s, %s, %s) ON CONFLICT (telegram_id) DO NOTHING",
+                    (1258360028, "@sentsuro", "Андрей", True, True)
                 )
-            ''')
-            
-            # Таблица каналов
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS channels (
-                    id SERIAL PRIMARY KEY,
-                    name TEXT NOT NULL,
-                    telegram_channel TEXT NOT NULL,
-                    vk_group_id TEXT NOT NULL,
-                    created_by INTEGER,
-                    is_active BOOLEAN DEFAULT TRUE,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (created_by) REFERENCES users (id)
+                
+            else:
+                # SQLite синтаксис
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS users (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        telegram_id INTEGER UNIQUE NOT NULL,
+                        username TEXT,
+                        first_name TEXT,
+                        is_admin BOOLEAN DEFAULT FALSE,
+                        is_approved BOOLEAN DEFAULT FALSE,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                ''')
+                
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS channels (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        name TEXT NOT NULL,
+                        telegram_channel TEXT NOT NULL,
+                        vk_group_id TEXT NOT NULL,
+                        created_by INTEGER,
+                        is_active BOOLEAN DEFAULT TRUE,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        FOREIGN KEY (created_by) REFERENCES users (id)
+                    )
+                ''')
+                
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS user_permissions (
+                        user_id INTEGER,
+                        channel_id INTEGER,
+                        can_post BOOLEAN DEFAULT TRUE,
+                        PRIMARY KEY (user_id, channel_id),
+                        FOREIGN KEY (user_id) REFERENCES users (id),
+                        FOREIGN KEY (channel_id) REFERENCES channels (id)
+                    )
+                ''')
+                
+                # Добавляем первого пользователя как администратора
+                cursor.execute(
+                    "INSERT OR IGNORE INTO users (telegram_id, username, first_name, is_admin, is_approved) VALUES (?, ?, ?, ?, ?)",
+                    (1258360028, "@sentsuro", "Андрей", True, True)
                 )
-            ''')
-            
-            # Таблица прав доступа
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS user_permissions (
-                    user_id INTEGER,
-                    channel_id INTEGER,
-                    can_post BOOLEAN DEFAULT TRUE,
-                    PRIMARY KEY (user_id, channel_id),
-                    FOREIGN KEY (user_id) REFERENCES users (id),
-                    FOREIGN KEY (channel_id) REFERENCES channels (id)
-                )
-            ''')
-            
-            # Добавляем первого пользователя как администратора
-            cursor.execute(
-                "INSERT INTO users (telegram_id, username, first_name, is_admin, is_approved) VALUES (%s, %s, %s, %s, %s) ON CONFLICT (telegram_id) DO NOTHING",
-                (1258360028, "@sentsuro", "Андрей", True, True)
-            )
             
             conn.commit()
-            logger.info("✅ База данных PostgreSQL инициализирована")
+            logger.info(f"✅ База данных {self.db_type.upper()} инициализирована")
             
         except Exception as e:
             logger.error(f"❌ Ошибка инициализации базы данных: {e}")
-            conn.rollback()
+            if self.db_type == 'postgresql':
+                conn.rollback()
+        finally:
+            cursor.close()
+            conn.close()
+    
+    def execute_query(self, query, params=None):
+        """Универсальный метод выполнения запросов"""
+        conn = self.get_db_connection()
+        cursor = conn.cursor()
+        
+        try:
+            if params:
+                cursor.execute(query, params)
+            else:
+                cursor.execute(query)
+            
+            # Для SELECT запросов возвращаем результат
+            if query.strip().upper().startswith('SELECT'):
+                result = cursor.fetchall()
+            else:
+                result = None
+                conn.commit()
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка выполнения запроса: {e}")
+            if self.db_type == 'postgresql':
+                conn.rollback()
+            return None
         finally:
             cursor.close()
             conn.close()
     
     def get_user(self, telegram_id):
         """Получаем информацию о пользователе"""
-        conn = self.get_db_connection()
-        cursor = conn.cursor()
+        if self.db_type == 'postgresql':
+            query = "SELECT id, username, first_name, is_admin, is_approved FROM users WHERE telegram_id = %s"
+        else:
+            query = "SELECT id, username, first_name, is_admin, is_approved FROM users WHERE telegram_id = ?"
         
-        try:
-            cursor.execute(
-                "SELECT id, username, first_name, is_admin, is_approved FROM users WHERE telegram_id = %s",
-                (telegram_id,)
-            )
-            user = cursor.fetchone()
-            
-            if user:
-                return {
-                    'id': user[0],
-                    'username': user[1],
-                    'first_name': user[2],
-                    'is_admin': user[3],
-                    'is_approved': user[4]
-                }
-            return None
-            
-        except Exception as e:
-            logger.error(f"❌ Ошибка получения пользователя: {e}")
-            return None
-        finally:
-            cursor.close()
-            conn.close()
+        result = self.execute_query(query, (telegram_id,))
+        
+        if result and result[0]:
+            user = result[0]
+            return {
+                'id': user[0],
+                'username': user[1],
+                'first_name': user[2],
+                'is_admin': user[3],
+                'is_approved': user[4]
+            }
+        return None
     
     def register_user(self, telegram_id, username, first_name):
         """Регистрируем нового пользователя (не approved)"""
-        conn = self.get_db_connection()
-        cursor = conn.cursor()
+        if self.db_type == 'postgresql':
+            query = "INSERT INTO users (telegram_id, username, first_name, is_approved) VALUES (%s, %s, %s, %s) ON CONFLICT (telegram_id) DO NOTHING"
+        else:
+            query = "INSERT OR IGNORE INTO users (telegram_id, username, first_name, is_approved) VALUES (?, ?, ?, ?)"
         
-        try:
-            cursor.execute(
-                "INSERT INTO users (telegram_id, username, first_name, is_approved) VALUES (%s, %s, %s, %s) ON CONFLICT (telegram_id) DO NOTHING",
-                (telegram_id, username, first_name, False)
-            )
-            conn.commit()
-            logger.info(f"✅ Зарегистрирован новый пользователь: {username}")
-            
-        except Exception as e:
-            logger.error(f"❌ Ошибка регистрации пользователя: {e}")
-            conn.rollback()
-        finally:
-            cursor.close()
-            conn.close()
+        self.execute_query(query, (telegram_id, username, first_name, False))
+        logger.info(f"✅ Зарегистрирован новый пользователь: {username}")
     
     def is_user_approved(self, telegram_id):
         """Проверяем approved ли пользователь"""
@@ -183,148 +247,125 @@ class AdminControlledReplyBot:
     
     def get_pending_users(self):
         """Получаем список пользователей ожидающих approval"""
-        conn = self.get_db_connection()
-        cursor = conn.cursor()
+        query = "SELECT telegram_id, username, first_name FROM users WHERE is_approved = FALSE"
+        result = self.execute_query(query)
         
-        try:
-            cursor.execute(
-                "SELECT telegram_id, username, first_name FROM users WHERE is_approved = FALSE"
-            )
-            users = cursor.fetchall()
-            
+        if result:
             return [{
                 'telegram_id': user[0],
                 'username': user[1],
                 'first_name': user[2]
-            } for user in users]
-            
-        except Exception as e:
-            logger.error(f"❌ Ошибка получения ожидающих пользователей: {e}")
-            return []
-        finally:
-            cursor.close()
-            conn.close()
+            } for user in result]
+        return []
     
     def approve_user(self, telegram_id):
         """Одобряем пользователя и даем доступ ко всем каналам"""
-        conn = self.get_db_connection()
-        cursor = conn.cursor()
-        
-        try:
-            cursor.execute(
+        if self.db_type == 'postgresql':
+            # Обновляем статус пользователя
+            self.execute_query(
                 "UPDATE users SET is_approved = TRUE WHERE telegram_id = %s",
                 (telegram_id,)
             )
             
             # Получаем ID пользователя
-            cursor.execute("SELECT id FROM users WHERE telegram_id = %s", (telegram_id,))
-            user_result = cursor.fetchone()
+            user_result = self.execute_query("SELECT id FROM users WHERE telegram_id = %s", (telegram_id,))
             
-            if user_result:
-                user_id = user_result[0]
+            if user_result and user_result[0]:
+                user_id = user_result[0][0]
                 
                 # Получаем все активные каналы
-                cursor.execute("SELECT id FROM channels WHERE is_active = TRUE")
-                channels = cursor.fetchall()
+                channels_result = self.execute_query("SELECT id FROM channels WHERE is_active = TRUE")
                 
                 # Даем доступ ко всем каналам
-                for channel in channels:
-                    cursor.execute(
+                for channel in channels_result:
+                    self.execute_query(
                         "INSERT INTO user_permissions (user_id, channel_id, can_post) VALUES (%s, %s, %s) ON CONFLICT (user_id, channel_id) DO UPDATE SET can_post = %s",
                         (user_id, channel[0], True, True)
                     )
                 
-                logger.info(f"✅ Пользователь {telegram_id} одобрен и получил доступ к {len(channels)} каналам")
+                logger.info(f"✅ Пользователь {telegram_id} одобрен и получил доступ к {len(channels_result)} каналам")
+        else:
+            # SQLite версия
+            self.execute_query(
+                "UPDATE users SET is_approved = TRUE WHERE telegram_id = ?",
+                (telegram_id,)
+            )
             
-            conn.commit()
+            user_result = self.execute_query("SELECT id FROM users WHERE telegram_id = ?", (telegram_id,))
             
-        except Exception as e:
-            logger.error(f"❌ Ошибка одобрения пользователя: {e}")
-            conn.rollback()
-        finally:
-            cursor.close()
-            conn.close()
+            if user_result and user_result[0]:
+                user_id = user_result[0][0]
+                channels_result = self.execute_query("SELECT id FROM channels WHERE is_active = TRUE")
+                
+                for channel in channels_result:
+                    self.execute_query(
+                        "INSERT OR REPLACE INTO user_permissions (user_id, channel_id, can_post) VALUES (?, ?, ?)",
+                        (user_id, channel[0], True)
+                    )
     
     def grant_access_to_all_users(self, channel_id):
         """Выдать доступ к новому каналу всем одобренным пользователям"""
-        conn = self.get_db_connection()
-        cursor = conn.cursor()
+        users_result = self.execute_query("SELECT id FROM users WHERE is_approved = TRUE")
         
-        try:
-            # Получаем всех одобренных пользователей
-            cursor.execute("SELECT id FROM users WHERE is_approved = TRUE")
-            users = cursor.fetchall()
+        if users_result:
+            for user in users_result:
+                if self.db_type == 'postgresql':
+                    self.execute_query(
+                        "INSERT INTO user_permissions (user_id, channel_id, can_post) VALUES (%s, %s, %s) ON CONFLICT (user_id, channel_id) DO UPDATE SET can_post = %s",
+                        (user[0], channel_id, True, True)
+                    )
+                else:
+                    self.execute_query(
+                        "INSERT OR REPLACE INTO user_permissions (user_id, channel_id, can_post) VALUES (?, ?, ?)",
+                        (user[0], channel_id, True)
+                    )
             
-            # Даем каждому пользователю доступ к новому каналу
-            for user in users:
-                cursor.execute(
-                    "INSERT INTO user_permissions (user_id, channel_id, can_post) VALUES (%s, %s, %s) ON CONFLICT (user_id, channel_id) DO UPDATE SET can_post = %s",
-                    (user[0], channel_id, True, True)
-                )
-            
-            conn.commit()
             logger.info(f"✅ Все одобренные пользователи получили доступ к каналу {channel_id}")
-            
-        except Exception as e:
-            logger.error(f"❌ Ошибка выдачи доступа пользователям: {e}")
-            conn.rollback()
-        finally:
-            cursor.close()
-            conn.close()
     
     def get_user_channels(self, user_id):
         """Получаем каналы доступные пользователю"""
-        conn = self.get_db_connection()
-        cursor = conn.cursor()
-        
-        try:
-            cursor.execute('''
+        if self.db_type == 'postgresql':
+            query = '''
                 SELECT c.id, c.name, c.telegram_channel, c.vk_group_id 
                 FROM channels c
                 LEFT JOIN user_permissions up ON c.id = up.channel_id AND up.user_id = %s
                 WHERE c.is_active = TRUE AND (up.can_post = TRUE OR c.created_by = %s OR 
                       (SELECT is_admin FROM users WHERE id = %s) = TRUE)
-            ''', (user_id, user_id, user_id))
-            
-            channels = cursor.fetchall()
-            
+            '''
+        else:
+            query = '''
+                SELECT c.id, c.name, c.telegram_channel, c.vk_group_id 
+                FROM channels c
+                LEFT JOIN user_permissions up ON c.id = up.channel_id AND up.user_id = ?
+                WHERE c.is_active = TRUE AND (up.can_post = TRUE OR c.created_by = ? OR 
+                      (SELECT is_admin FROM users WHERE id = ?) = TRUE)
+            '''
+        
+        result = self.execute_query(query, (user_id, user_id, user_id))
+        
+        if result:
             return [{
                 'id': channel[0],
                 'name': channel[1],
                 'telegram': channel[2],
                 'vk_group_id': channel[3]
-            } for channel in channels]
-            
-        except Exception as e:
-            logger.error(f"❌ Ошибка получения каналов пользователя: {e}")
-            return []
-        finally:
-            cursor.close()
-            conn.close()
+            } for channel in result]
+        return []
     
     def get_all_channels(self):
         """Получаем все каналы (для админов)"""
-        conn = self.get_db_connection()
-        cursor = conn.cursor()
+        query = "SELECT id, name, telegram_channel, vk_group_id FROM channels WHERE is_active = TRUE"
+        result = self.execute_query(query)
         
-        try:
-            cursor.execute("SELECT id, name, telegram_channel, vk_group_id FROM channels WHERE is_active = TRUE")
-            channels = cursor.fetchall()
-            
+        if result:
             return [{
                 'id': channel[0],
                 'name': channel[1],
                 'telegram': channel[2],
                 'vk_group_id': channel[3]
-            } for channel in channels]
-            
-        except Exception as e:
-            logger.error(f"❌ Ошибка получения всех каналов: {e}")
-            return []
-        finally:
-            cursor.close()
-            conn.close()
-    
+            } for channel in result]
+        return []
+
     def check_vk_token(self):
         """Проверка валидности VK токена"""
         if not self.vk_api:
@@ -910,48 +951,62 @@ class AdminControlledReplyBot:
         elif stage == 'awaiting_vk':
             user_data['new_vk_group_id'] = text
             
-            # Сохраняем канал в базу данных
-            conn = self.get_db_connection()
-            cursor = conn.cursor()
-            
             try:
                 user = update.effective_user
                 user_info = self.get_user(user.id)
                 
-                cursor.execute(
-                    "INSERT INTO channels (name, telegram_channel, vk_group_id, created_by) VALUES (%s, %s, %s, %s) RETURNING id",
-                    (user_data['new_channel_name'], user_data['new_telegram_channel'], user_data['new_vk_group_id'], user_info['id'])
-                )
+                if self.db_type == 'postgresql':
+                    result = self.execute_query(
+                        "INSERT INTO channels (name, telegram_channel, vk_group_id, created_by) VALUES (%s, %s, %s, %s) RETURNING id",
+                        (user_data['new_channel_name'], user_data['new_telegram_channel'], user_data['new_vk_group_id'], user_info['id'])
+                    )
+                    channel_id = result[0][0] if result else None
+                else:
+                    conn = self.get_db_connection()
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        "INSERT INTO channels (name, telegram_channel, vk_group_id, created_by) VALUES (?, ?, ?, ?)",
+                        (user_data['new_channel_name'], user_data['new_telegram_channel'], user_data['new_vk_group_id'], user_info['id'])
+                    )
+                    channel_id = cursor.lastrowid
+                    conn.commit()
+                    cursor.close()
+                    conn.close()
                 
-                channel_id = cursor.fetchone()[0]
-                
-                # Автоматически даем доступ создателю
-                cursor.execute(
-                    "INSERT INTO user_permissions (user_id, channel_id, can_post) VALUES (%s, %s, %s) ON CONFLICT (user_id, channel_id) DO UPDATE SET can_post = %s",
-                    (user_info['id'], channel_id, True, True)
-                )
-                
-                conn.commit()
-                
-                # Даем доступ к новому каналу всем одобренным пользователям
-                self.grant_access_to_all_users(channel_id)
-                
-                # Очищаем временные данные
-                context.user_data.clear()
-                
-                await update.message.reply_text(
-                    f"🎉 Канал '{user_data['new_channel_name']}' успешно добавлен!\n\n"
-                    "Все одобренные пользователи автоматически получили доступ к этому каналу.",
-                    reply_markup=reply_markup
-                )
+                if channel_id:
+                    # Автоматически даем доступ создателю
+                    if self.db_type == 'postgresql':
+                        self.execute_query(
+                            "INSERT INTO user_permissions (user_id, channel_id, can_post) VALUES (%s, %s, %s) ON CONFLICT (user_id, channel_id) DO UPDATE SET can_post = %s",
+                            (user_info['id'], channel_id, True, True)
+                        )
+                    else:
+                        self.execute_query(
+                            "INSERT OR REPLACE INTO user_permissions (user_id, channel_id, can_post) VALUES (?, ?, ?)",
+                            (user_info['id'], channel_id, True)
+                        )
+                    
+                    # Даем доступ к новому каналу всем одобренным пользователям
+                    self.grant_access_to_all_users(channel_id)
+                    
+                    # Очищаем временные данные
+                    context.user_data.clear()
+                    
+                    await update.message.reply_text(
+                        f"🎉 Канал '{user_data['new_channel_name']}' успешно добавлен!\n\n"
+                        "Все одобренные пользователи автоматически получили доступ к этому каналу.",
+                        reply_markup=reply_markup
+                    )
+                else:
+                    raise Exception("Не удалось получить ID созданного канала")
                 
             except Exception as e:
                 logger.error(f"❌ Ошибка добавления канала: {e}")
-                conn.rollback()
                 await update.message.reply_text(
                     "❌ Ошибка при добавлении канала. Попробуйте снова.",
                     reply_markup=reply_markup
                 )
+                
             finally:
                 cursor.close()
                 conn.close()
@@ -1214,4 +1269,3 @@ class AdminControlledReplyBot:
 if __name__ == "__main__":
     bot = AdminControlledReplyBot()
     bot.run()
-
