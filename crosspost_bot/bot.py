@@ -11,7 +11,6 @@ from vk_api.upload import VkUpload
 from io import BytesIO
 from flask import Flask
 import threading
-import asyncio
 import signal
 import sys
 
@@ -1347,42 +1346,57 @@ class AdminControlledReplyBot:
         
         await update.message.reply_text(self.get_vk_token_message())
     
-    def run_bot(self):
-        """Запуск бота в синхронном режиме"""
-        retries = 0
-        max_retries = 3
-        initial_delay = 10
+    def run_bot_forever(self):
+        """Запуск бота в бесконечном цикле с перезапуском при ошибках"""
+        restart_count = 0
+        max_restarts_per_hour = 10
+        last_restart_time = time.time()
         
-        while retries < max_retries and self.is_running:
+        while self.is_running:
             try:
-                logger.info(f"🚀 Запуск бота на Render.com (попытка {retries + 1}/{max_retries})...")
+                current_time = time.time()
+                # Сбрасываем счетчик рестартов если прошло больше часа
+                if current_time - last_restart_time > 3600:
+                    restart_count = 0
+                    last_restart_time = current_time
                 
-                # Используем синхронный run_polling
+                if restart_count >= max_restarts_per_hour:
+                    logger.error(f"❌ Достигнут лимит рестартов ({max_restarts_per_hour} в час). Остановка.")
+                    break
+                
+                logger.info(f"🚀 Запуск бота (попытка {restart_count + 1})...")
+                
+                # Запускаем бота
                 self.tg_app.run_polling(
                     drop_pending_updates=True,
                     allowed_updates=None,
                     close_loop=False
                 )
-                break
+                
+                # Если бот завершился без ошибки, ждем перед перезапуском
+                logger.warning("🔄 Бот завершил работу, перезапуск через 10 секунд...")
+                time.sleep(10)
                 
             except Exception as e:
-                retries += 1
+                restart_count += 1
                 error_msg = str(e)
+                logger.error(f"❌ Ошибка бота: {error_msg}")
                 
                 if "Conflict" in error_msg or "terminated by other getUpdates" in error_msg:
-                    logger.warning(f"🔄 Конфликт обнаружен, повтор через {initial_delay} сек...")
-                    time.sleep(initial_delay)
-                    initial_delay *= 2
+                    logger.warning("🔄 Конфликт обнаружен, перезапуск через 30 секунд...")
+                    time.sleep(30)
                 else:
-                    logger.error(f"❌ Критическая ошибка: {error_msg}")
-                    if retries < max_retries:
-                        logger.info(f"🔄 Перезапуск через {initial_delay} сек...")
-                        time.sleep(initial_delay)
-                        initial_delay *= 2
-                    else:
-                        logger.error("❌ Достигнут лимит попыток запуска")
-                        break
-    
+                    logger.warning("🔄 Перезапуск через 60 секунд...")
+                    time.sleep(60)
+            
+            finally:
+                # Всегда пытаемся остановить приложение перед перезапуском
+                try:
+                    if self.tg_app.running:
+                        self.tg_app.stop()
+                except:
+                    pass
+
     def stop(self):
         """Остановка бота"""
         self.is_running = False
@@ -1420,8 +1434,8 @@ def main():
     try:
         global bot
         bot = AdminControlledReplyBot()
-        logger.info("🤖 Бот инициализирован, запускаем polling...")
-        bot.run_bot()
+        logger.info("🤖 Бот инициализирован, запускаем вечный polling...")
+        bot.run_bot_forever()
     except Exception as e:
         logger.error(f"❌ Критическая ошибка при запуске бота: {e}")
 
