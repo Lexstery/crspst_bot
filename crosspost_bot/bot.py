@@ -14,7 +14,11 @@ import threading
 import signal
 import sys
 import requests
-import schedule
+
+# ==================== НАСТРОЙКИ ====================
+PING_INTERVAL_MINUTES = 10  # ⚠️ ИЗМЕНИТЕ ЗДЕСЬ: интервал само-пинга в минутах
+PING_INTERVAL_SECONDS = PING_INTERVAL_MINUTES * 60
+# ===================================================
 
 # Загружаем переменные окружения
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
@@ -47,15 +51,16 @@ def health():
 def status():
     return {
         "status": "running",
-        "service": "telegram-vk-bot",
-        "timestamp": time.time()
+        "service": "telegram-vk-bot", 
+        "timestamp": time.time(),
+        "ping_interval_minutes": PING_INTERVAL_MINUTES
     }
 
 @app.route('/ping')
 def ping():
     """Эндпоинт для пингов от мониторинга"""
     logger.info("🏓 Получен пинг")
-    return "🏓 PONG"
+    return f"🏓 PONG | Self-ping every {PING_INTERVAL_MINUTES}min"
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
@@ -71,22 +76,25 @@ def webhook():
     return "BOT_NOT_READY", 503
 
 def ping_self():
-    """Функция для само-пинга каждые 10 минут"""
+    """Функция для само-пинга каждые N минут"""
     if not RENDER_EXTERNAL_URL:
+        logger.warning("❌ RENDER_EXTERNAL_URL не установлен, само-пинг отключен")
         return
         
+    logger.info(f"🔔 Запущен само-пинг каждые {PING_INTERVAL_MINUTES} минут")
+    
     while True:
         try:
             response = requests.get(f"{RENDER_EXTERNAL_URL}/ping", timeout=10)
             if response.status_code == 200:
-                logger.info("🔔 Само-пинг выполнен успешно")
+                logger.info(f"🔔 Само-пинг выполнен успешно (интервал: {PING_INTERVAL_MINUTES} мин)")
             else:
                 logger.warning(f"⚠️ Само-пинг вернул статус {response.status_code}")
         except Exception as e:
             logger.error(f"❌ Ошибка само-пинга: {e}")
         
-        # Ждем 10 минут до следующего пина
-        time.sleep(60)
+        # Ждем указанное количество минут до следующего пина
+        time.sleep(PING_INTERVAL_SECONDS)
 
 class AdminControlledReplyBot:
     def __init__(self):
@@ -1442,7 +1450,9 @@ def main():
         if RENDER_EXTERNAL_URL:
             ping_thread = threading.Thread(target=ping_self, daemon=True)
             ping_thread.start()
-            logger.info("🔔 Запущен само-пинг каждые 10 минут")
+            logger.info(f"🔔 Запущен само-пинг каждые {PING_INTERVAL_MINUTES} минут")
+        else:
+            logger.warning("⚠️ RENDER_EXTERNAL_URL не установлен, само-пинг отключен")
         
         # Запускаем Flask
         logger.info("🚀 Запуск Flask сервера...")
