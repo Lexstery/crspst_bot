@@ -2,7 +2,7 @@ import logging
 import os
 import re
 from urllib.parse import unquote
-import psycopg2
+import psycopg
 from telegram import Update, InputFile, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from vk_api import VkApi
@@ -36,7 +36,7 @@ class AdminControlledReplyBot:
         """Получаем соединение с базой данных"""
         if DATABASE_URL:
             # PostgreSQL на Render
-            conn = psycopg2.connect(DATABASE_URL, sslmode='require')
+            conn = psycopg.connect(DATABASE_URL, sslmode='require')
         else:
             # Локально SQLite (для разработки)
             import sqlite3
@@ -1214,3 +1214,4 @@ class AdminControlledReplyBot:
 if __name__ == "__main__":
     bot = AdminControlledReplyBot()
     bot.run()
+
