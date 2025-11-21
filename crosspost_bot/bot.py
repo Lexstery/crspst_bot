@@ -16,7 +16,7 @@ import sys
 import requests
 
 # ==================== НАСТРОЙКИ ====================
-PING_INTERVAL_MINUTES = 10  # ⚠️ ИЗМЕНИТЕ ЗДЕСЬ: интервал само-пинга в минутах
+PING_INTERVAL_MINUTES = 1  # ⚠️ ИЗМЕНИТЕ ЗДЕСЬ: интервал само-пинга в минутах
 PING_INTERVAL_SECONDS = PING_INTERVAL_MINUTES * 60
 # ===================================================
 
@@ -1464,3 +1464,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
