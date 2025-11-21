@@ -576,13 +576,21 @@ class AdminControlledReplyBot:
         elif text == "➕ Добавить канал" and user_info['is_admin']:
             await self.start_add_channel(update, context)
         
+        # Обработка подтверждения добавления администратора
+        elif text == "✅ Да, сделать администратором" and context.user_data.get('setup_stage') == 'confirm_admin_addition':
+            await self.complete_admin_addition(update, context)
+        
+        # Обработка процесса добавления администратора
+        elif context.user_data.get('setup_stage', '').startswith('awaiting_admin'):
+            await self.handle_admin_setup(update, context, text)
+        
         # Если это выбор канала для публикации
         elif text.startswith("📢 "):
             channel_name = text[2:]  # Убираем эмодзи
             await self.select_channel_for_publishing(update, context, channel_name)
         
         # Обработка процесса добавления канала
-        elif 'setup_stage' in context.user_data:
+        elif 'setup_stage' in context.user_data and context.user_data['setup_stage'].startswith('awaiting_'):
             await self.handle_channel_setup(update, context, text)
         
         # Если это обычный текст и выбран канал - публикуем
@@ -924,11 +932,12 @@ class AdminControlledReplyBot:
                 )
     
     async def cancel_setup(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Отмена процесса добавления канала"""
+        """Отмена процесса добавления канала или администратора"""
         if 'setup_stage' in context.user_data:
+            setup_type = "канала" if 'new_channel_name' in context.user_data else "администратора"
             context.user_data.clear()
             await update.message.reply_text(
-                "❌ Процесс добавления канала отменен.",
+                f"❌ Процесс добавления {setup_type} отменен.",
                 reply_markup=ReplyKeyboardRemove()
             )
             await self.show_main_menu(update, context)
@@ -1084,16 +1093,28 @@ class AdminControlledReplyBot:
             await update.message.reply_text("❌ Эта команда только для администраторов")
             return
         
+        # Получаем список всех администраторов
+        admins_result = self.execute_query("SELECT username, first_name FROM users WHERE is_admin = TRUE")
+        
+        message = "👑 **Управление администраторами**\n\n"
+        
+        if admins_result:
+            message += "📋 **Текущие администраторы:**\n\n"
+            for admin in admins_result:
+                message += f"• {admin[1]} (@{admin[0]})\n"
+            message += "\n"
+        else:
+            message += "❌ Нет администраторов\n\n"
+        
+        message += "Выберите действие:"
+        
         keyboard = [
-            ["👥 Список админов", "➕ Добавить админа"],
+            ["➕ Добавить админа", "👥 Список админов"],
             ["🔙 Назад в меню"]
         ]
         reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
         
-        await update.message.reply_text(
-            "👑 Управление администраторами:",
-            reply_markup=reply_markup
-        )
+        await update.message.reply_text(message, reply_markup=reply_markup)
 
     async def show_admins_list(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Показать список администраторов"""
@@ -1129,14 +1150,141 @@ class AdminControlledReplyBot:
         
         context.user_data['setup_stage'] = 'awaiting_admin_telegram_id'
         
-        keyboard = [["🔙 Назад в меню"]]
+        keyboard = [["❌ Отменить добавление"]]
         reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
         
         await update.message.reply_text(
-            "👑 Добавление администратора\n\n"
-            "Введите Telegram ID пользователя:",
+            "👑 **Добавление администратора**\n\n"
+            "Введите Telegram ID пользователя (только цифры):\n\n"
+            "❌ Для отмены нажмите кнопку ниже",
             reply_markup=reply_markup
         )
+
+    async def handle_admin_setup(self, update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
+        """Обработка процесса добавления администратора"""
+        user_data = context.user_data
+        stage = user_data['setup_stage']
+        
+        keyboard = [["❌ Отменить добавление"]]
+        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+        
+        if stage == 'awaiting_admin_telegram_id':
+            # Проверяем, что введены только цифры
+            if not text.isdigit():
+                await update.message.reply_text(
+                    "❌ Неверный формат Telegram ID!\n\n"
+                    "Telegram ID должен содержать только цифры.\n"
+                    "Попробуйте снова:",
+                    reply_markup=reply_markup
+                )
+                return
+            
+            telegram_id = int(text)
+            
+            # Проверяем, не пытаемся ли добавить себя
+            if telegram_id == update.effective_user.id:
+                await update.message.reply_text(
+                    "❌ Вы не можете добавить сами себя!\n\n"
+                    "Вы уже являетесь администратором.",
+                    reply_markup=reply_markup
+                )
+                context.user_data.clear()
+                await self.show_main_menu(update, context)
+                return
+            
+            # Проверяем, существует ли пользователь
+            target_user = self.get_user(telegram_id)
+            if not target_user:
+                await update.message.reply_text(
+                    "❌ Пользователь не найден!\n\n"
+                    "Пользователь с таким Telegram ID еще не зарегистрирован в боте.\n"
+                    "Попросите пользователя сначала написать /start боту, затем попробуйте снова.",
+                    reply_markup=reply_markup
+                )
+                context.user_data.clear()
+                await self.show_main_menu(update, context)
+                return
+            
+            # Проверяем, не является ли пользователь уже администратором
+            if target_user['is_admin']:
+                await update.message.reply_text(
+                    f"❌ Пользователь {target_user['first_name']} (@{target_user['username']}) уже является администратором!",
+                    reply_markup=reply_markup
+                )
+                context.user_data.clear()
+                await self.show_main_menu(update, context)
+                return
+            
+            # Сохраняем данные и запрашиваем подтверждение
+            user_data['new_admin_telegram_id'] = telegram_id
+            user_data['new_admin_username'] = target_user['username']
+            user_data['new_admin_first_name'] = target_user['first_name']
+            user_data['setup_stage'] = 'confirm_admin_addition'
+            
+            keyboard = [
+                ["✅ Да, сделать администратором"],
+                ["❌ Нет, отменить"]
+            ]
+            reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+            
+            await update.message.reply_text(
+                f"👑 **Подтверждение добавления администратора**\n\n"
+                f"Вы собираетесь назначить администратором:\n"
+                f"• Имя: {target_user['first_name']}\n"
+                f"• Username: @{target_user['username']}\n"
+                f"• Telegram ID: {telegram_id}\n\n"
+                f"Это даст пользователю полный доступ ко всем функциям бота.\n\n"
+                f"Подтвердите действие:",
+                reply_markup=reply_markup
+            )
+
+    async def complete_admin_addition(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Завершение процесса добавления администратора"""
+        user_data = context.user_data
+        
+        try:
+            telegram_id = user_data['new_admin_telegram_id']
+            username = user_data['new_admin_username']
+            first_name = user_data['new_admin_first_name']
+            
+            # Назначаем пользователя администратором
+            result = self.execute_query(
+                "UPDATE users SET is_admin = TRUE, is_approved = TRUE WHERE telegram_id = %s",
+                (telegram_id,)
+            )
+            
+            if result:
+                # Даем доступ ко всем каналам
+                self.approve_user(telegram_id)
+                
+                # Очищаем временные данные
+                context.user_data.clear()
+                
+                await update.message.reply_text(
+                    f"🎉 Пользователь {first_name} (@{username}) успешно назначен администратором!\n\n"
+                    f"✅ Пользователь получил:\n"
+                    f"• Права администратора\n"
+                    f"• Доступ ко всем каналам\n"
+                    f"• Возможность управлять ботом",
+                    reply_markup=ReplyKeyboardRemove()
+                )
+                
+                # Показываем главное меню
+                await self.show_main_menu(update, context)
+            else:
+                await update.message.reply_text(
+                    "❌ Ошибка при назначении администратора. Пользователь не найден.",
+                    reply_markup=ReplyKeyboardRemove()
+                )
+                await self.show_main_menu(update, context)
+                
+        except Exception as e:
+            logger.error(f"❌ Ошибка добавления администратора: {e}")
+            await update.message.reply_text(
+                "❌ Ошибка при добавлении администратора. Попробуйте снова.",
+                reply_markup=ReplyKeyboardRemove()
+            )
+            await self.show_main_menu(update, context)
     
     async def status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Показать статус подключений"""
@@ -1206,4 +1354,5 @@ if __name__ == "__main__":
     time.sleep(5)
     bot = AdminControlledReplyBot()
     bot.run_with_retry(max_retries=3, initial_delay=10)
+
 
