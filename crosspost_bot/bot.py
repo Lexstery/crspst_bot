@@ -1,5 +1,7 @@
 import logging
 import sqlite3
+import re
+from urllib.parse import unquote
 from telegram import Update, InputFile, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from vk_api import VkApi
@@ -29,7 +31,8 @@ class AdminControlledReplyBot:
         self.tg_app.add_handler(CommandHandler("hide", self.hide_keyboard))
         self.tg_app.add_handler(CommandHandler("status", self.status_command))
         self.tg_app.add_handler(CommandHandler("get_token", self.get_token_command))
-        self.tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_text_message))
+        self.tg_app.add_handler(CommandHandler("update_token", self.update_token_command))
+        self.tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_text_message_with_token))
         self.tg_app.add_handler(MessageHandler(filters.PHOTO, self.handle_photo))
     
     def init_vk_api(self):
@@ -65,13 +68,172 @@ class AdminControlledReplyBot:
             "1. **Перейди по ссылке:**\n"
             "https://oauth.vk.com/authorize?client_id=6121396&scope=photos,groups,wall,offline&redirect_uri=https://oauth.vk.com/blank.html&display=page&v=5.199&response_type=token\n\n"
             "2. **Скопируй токен из адресной строки** (часть между `access_token=` и `&expires_in`)\n\n"
-            "3. **Обнови файл `.env`:**\n"
-            "```\nVK_TOKEN=твой_новый_токен_здесь\n```\n\n"
-            "4. **Перезапусти бота**\n\n"
+            "3. **Обнови токен командой:**\n"
+            "`/update_token твой_новый_токен`\n\n"
+            "**Или просто отправь ссылку из адресной строки** - бот автоматически извлечет токен!\n\n"
             "📎 **Ссылка для копирования:**\n"
             "`https://oauth.vk.com/authorize?client_id=6121396&scope=photos,groups,wall,offline&redirect_uri=https://oauth.vk.com/blank.html&display=page&v=5.199&response_type=token`"
         )
         return token_message
+    
+    def extract_token_from_input(self, input_text: str) -> str:
+        """Извлекает токен из различных форматов ввода"""
+        # Если это URL с токеном
+        if 'access_token=' in input_text:
+            # Декодируем URL
+            decoded_url = unquote(input_text)
+            
+            # Ищем токен в URL - ВСЕ символы до следующего параметра (&)
+            token_match = re.search(r'access_token=([^&]+)', decoded_url)
+            if token_match:
+                return token_match.group(1)
+        
+        # Если это прямая ссылка на oauth.vk.com
+        elif 'oauth.vk.com' in input_text:
+            # Пробуем извлечь из фрагмента URL
+            fragment_match = re.search(r'#(.+)', input_text)
+            if fragment_match:
+                fragment = fragment_match.group(1)
+                token_match = re.search(r'access_token=([^&]+)', fragment)
+                if token_match:
+                    return token_match.group(1)
+        
+        # Если это просто токен (может содержать буквы, цифры, точки, дефисы, подчеркивания)
+        elif re.match(r'^[a-zA-Z0-9\.\-_]+$', input_text.strip()):
+            return input_text.strip()
+        
+        return None
+    
+    def update_vk_token(self, new_token: str) -> bool:
+        """Обновляет VK токен в памяти и в файле .env"""
+        try:
+            # Обновляем в памяти
+            global VK_TOKEN
+            VK_TOKEN = new_token
+            
+            # Переинициализируем VK API
+            self.init_vk_api()
+            
+            # Обновляем в файле .env
+            self.update_env_file(new_token)
+            
+            logger.info("✅ VK токен успешно обновлен")
+            return True
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка обновления токена: {e}")
+            return False
+    
+    def update_env_file(self, new_token: str):
+        """Обновляет токен в файле .env"""
+        try:
+            # Читаем текущий файл
+            with open('.env', 'r', encoding='utf-8') as file:
+                lines = file.readlines()
+            
+            # Обновляем или добавляем VK_TOKEN
+            token_updated = False
+            new_lines = []
+            
+            for line in lines:
+                if line.startswith('VK_TOKEN='):
+                    new_lines.append(f'VK_TOKEN={new_token}\n')
+                    token_updated = True
+                else:
+                    new_lines.append(line)
+            
+            # Если токен не был найден, добавляем новую строку
+            if not token_updated:
+                new_lines.append(f'VK_TOKEN={new_token}\n')
+            
+            # Записываем обратно
+            with open('.env', 'w', encoding='utf-8') as file:
+                file.writelines(new_lines)
+                
+            logger.info("✅ Файл .env обновлен")
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка обновления .env файла: {e}")
+            raise
+    
+    async def update_token_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Команда для обновления VK токена через ссылку"""
+        user = update.effective_user
+        user_info = self.get_user(user.id)
+        
+        if not user_info or not user_info['is_admin']:
+            await update.message.reply_text("❌ Эта команда только для администраторов")
+            return
+        
+        # Проверяем, есть ли ссылка в сообщении
+        if not context.args:
+            await update.message.reply_text(
+                "🔧 **Обновление VK токена**\n\n"
+                "Отправьте команду в формате:\n"
+                "`/update_token https://oauth.vk.com/blank.html#access_token=ваш_токен&expires_in=...`\n\n"
+                "Или просто отправьте новый токен:\n"
+                "`/update_token ваш_новый_токен`\n\n"
+                "Также можно просто отправить ссылку в чат - бот автоматически распознает токен!"
+            )
+            return
+        
+        token_input = ' '.join(context.args)
+        new_token = self.extract_token_from_input(token_input)
+        
+        if not new_token:
+            await update.message.reply_text(
+                "❌ Не удалось извлечь токен из ссылки.\n\n"
+                "Проверьте формат:\n"
+                "• Ссылка должна содержать `access_token=...`\n"
+                "• Или отправьте только токен\n"
+                f"Полученный ввод: {token_input[:100]}..."
+            )
+            return
+        
+        # Обновляем токен
+        if self.update_vk_token(new_token):
+            await update.message.reply_text(
+                f"✅ VK токен успешно обновлен!\n\n"
+                f"Токен: `{new_token[:15]}...{new_token[-10:]}`\n"
+                f"Длина токена: {len(new_token)} символов\n\n"
+                f"Статус VK: {'✅ Работает' if self.check_vk_token() else '❌ Ошибка'}\n\n"
+                f"Проверьте статус: /status"
+            )
+        else:
+            await update.message.reply_text("❌ Ошибка при обновлении токена")
+    
+    async def handle_token_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработка сообщений с токенами (автоматическое определение)"""
+        user = update.effective_user
+        user_info = self.get_user(user.id)
+        
+        if not user_info or not user_info['is_admin']:
+            return
+        
+        text = update.message.text
+        
+        # Проверяем, содержит ли сообщение токен VK
+        if any(keyword in text for keyword in ['access_token=', 'oauth.vk.com']):
+            new_token = self.extract_token_from_input(text)
+            
+            if new_token:
+                if self.update_vk_token(new_token):
+                    await update.message.reply_text(
+                        f"✅ VK токен автоматически обновлен!\n\n"
+                        f"Токен: `{new_token[:15]}...{new_token[-10:]}`\n"
+                        f"Длина токена: {len(new_token)} символов\n\n"
+                        f"Статус VK: {'✅ Работает' if self.check_vk_token() else '❌ Ошибка'}\n\n"
+                        f"Проверьте статус: /status"
+                    )
+                else:
+                    await update.message.reply_text("❌ Ошибка при автоматическом обновлении токена")
+    
+    async def handle_text_message_with_token(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Объединенный обработчик текстовых сообщений"""
+        # Сначала проверяем токен
+        await self.handle_token_message(update, context)
+        # Затем стандартная обработка
+        await self.handle_text_message(update, context)
     
     def init_database(self):
         """Инициализация базы данных"""
@@ -508,7 +670,7 @@ class AdminControlledReplyBot:
             )
             
             if not self.check_vk_token() and user_info['is_admin']:
-                message += f"\n\n🔧 Для обновления токена: /get_token"
+                message += f"\n\n🔧 Для обновления токена: /get_token или /update_token"
             
             await update.message.reply_text(message, reply_markup=reply_markup)
         else:
@@ -685,7 +847,12 @@ class AdminControlledReplyBot:
         message += "• /menu - Показать главное меню\n"
         message += "• /hide - Скрыть меню\n"
         message += "• /status - Проверить статус подключений\n"
-        message += "• /get_token - Получить ссылку для нового VK токена (только админы)\n\n"
+        message += "• /get_token - Получить ссылку для нового VK токена\n"
+        
+        if user_info['is_admin']:
+            message += "• /update_token - Обновить VK токен (админы)\n\n"
+        else:
+            message += "\n"
         
         message += "🎯 **Как опубликовать пост:**\n"
         message += "1. Нажмите '📢 Опубликовать пост'\n"
@@ -699,7 +866,8 @@ class AdminControlledReplyBot:
         if user_info['is_admin']:
             message += "👥 **Функции администратора:**\n"
             message += "• '👥 Управление пользователями' - одобрение новых пользователей\n"
-            message += "• '⚙️ Управление каналами' - просмотр и добавление каналов\n\n"
+            message += "• '⚙️ Управление каналами' - просмотр и добавление каналов\n"
+            message += "• /update_token - обновление VK токена\n\n"
         
         message += "❓ **Если у вас нет доступа к каналам или возникли проблемы - обратитесь к администратору.**"
         
@@ -757,7 +925,7 @@ class AdminControlledReplyBot:
                 vk_status = "⚠️ VK недоступен (токен истек)"
                 if user_info := self.get_user(user.id):
                     if user_info['is_admin']:
-                        vk_status += "\n🔧 Для получения нового токена: /get_token"
+                        vk_status += "\n🔧 Для получения нового токена: /get_token или /update_token"
             
             await update.message.reply_text(f"✅ Фото опубликовано в: {channel['name']}\n{vk_status}")
             
@@ -795,7 +963,7 @@ class AdminControlledReplyBot:
                 vk_status = "⚠️ VK недоступен (токен истек)"
                 if user_info := self.get_user(user.id):
                     if user_info['is_admin']:
-                        vk_status += "\n🔧 Для получения нового токена: /get_token"
+                        vk_status += "\n🔧 Для получения нового токена: /get_token или /update_token"
             
             await update.message.reply_text(f"✅ Опубликовано в: {channel['name']}\n{vk_status}")
             
@@ -806,10 +974,6 @@ class AdminControlledReplyBot:
             logger.error(f"Ошибка публикации: {e}")
             await update.message.reply_text(f"❌ Ошибка: {e}")
     
-    def run(self):
-        logger.info("Бот с Reply Keyboard и контролем доступа запущен...")
-        self.tg_app.run_polling()
-
     async def admin_management(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Управление администраторами"""
         user = update.effective_user
@@ -877,10 +1041,11 @@ class AdminControlledReplyBot:
             "Введите Telegram ID пользователя:",
             reply_markup=reply_markup
         )
-
-
+    
+    def run(self):
+        logger.info("Бот с Reply Keyboard и контролем доступа запущен...")
+        self.tg_app.run_polling()
 
 if __name__ == "__main__":
     bot = AdminControlledReplyBot()
     bot.run()
-
