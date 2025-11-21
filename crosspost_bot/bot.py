@@ -9,6 +9,8 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 from vk_api import VkApi
 from vk_api.upload import VkUpload
 from io import BytesIO
+from flask import Flask, request
+import threading
 
 # Загружаем переменные окружения
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
@@ -17,6 +19,25 @@ DATABASE_URL = os.getenv('DATABASE_URL')
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Создаем Flask приложение для health checks
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "🤖 Telegram-VK Crossposting Bot is running!"
+
+@app.route('/health')
+def health():
+    return "✅ OK"
+
+@app.route('/status')
+def status():
+    return {
+        "status": "running",
+        "service": "telegram-vk-bot",
+        "timestamp": time.time()
+    }
 
 class AdminControlledReplyBot:
     def __init__(self):
@@ -1156,7 +1177,7 @@ class AdminControlledReplyBot:
         await update.message.reply_text(
             "👑 **Добавление администратора**\n\n"
             "Введите Telegram ID пользователя (только цифры):\n\n"
-            "❌ Для отмены нажмите кнопку ниже",
+            "❌ Для отмена нажмите кнопку ниже",
             reply_markup=reply_markup
         )
 
@@ -1349,10 +1370,24 @@ class AdminControlledReplyBot:
                     logger.error("❌ Достигнут лимит попыток запуска")
                     break
 
+def run_flask_app():
+    """Запуск Flask приложения для health checks"""
+    port = int(os.environ.get('PORT', 10000))
+    app.run(host='0.0.0.0', port=port, debug=False)
+
 if __name__ == "__main__":
+    # Запускаем Flask в отдельном потоке
+    flask_thread = threading.Thread(target=run_flask_app, daemon=True)
+    flask_thread.start()
+    
+    logger.info("🚀 Flask сервер запущен для health checks")
+    
     # Даем время завершиться предыдущему процессу
     time.sleep(5)
-    bot = AdminControlledReplyBot()
-    bot.run_with_retry(max_retries=3, initial_delay=10)
-
-
+    
+    try:
+        bot = AdminControlledReplyBot()
+        logger.info("🤖 Бот инициализирован, запускаем polling...")
+        bot.run_with_retry(max_retries=3, initial_delay=10)
+    except Exception as e:
+        logger.error(f"❌ Критическая ошибка при запуске бота: {e}")
