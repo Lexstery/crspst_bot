@@ -9,15 +9,18 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 from vk_api import VkApi
 from vk_api.upload import VkUpload
 from io import BytesIO
-from flask import Flask
+from flask import Flask, request
 import threading
 import signal
 import sys
+import requests
+import schedule
 
 # Загружаем переменные окружения
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 VK_TOKEN = os.getenv('VK_TOKEN')
 DATABASE_URL = os.getenv('DATABASE_URL')
+RENDER_EXTERNAL_URL = os.getenv('RENDER_EXTERNAL_URL')
 
 logging.basicConfig(
     level=logging.INFO,
@@ -25,8 +28,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Создаем Flask приложение для health checks
+# Создаем Flask приложение
 app = Flask(__name__)
+
+# Глобальные переменные
+bot_app = None
+ping_thread = None
 
 @app.route('/')
 def home():
@@ -44,6 +51,43 @@ def status():
         "timestamp": time.time()
     }
 
+@app.route('/ping')
+def ping():
+    """Эндпоинт для пингов от мониторинга"""
+    logger.info("🏓 Получен пинг")
+    return "🏓 PONG"
+
+@app.route('/webhook', methods=['POST'])
+def webhook():
+    """Эндпоинт для вебхуков от Telegram"""
+    if bot_app:
+        try:
+            update = Update.de_json(request.get_json(), bot_app.bot)
+            bot_app.process_update(update)
+            return "OK"
+        except Exception as e:
+            logger.error(f"❌ Ошибка обработки вебхука: {e}")
+            return "ERROR", 500
+    return "BOT_NOT_READY", 503
+
+def ping_self():
+    """Функция для само-пинга каждые 10 минут"""
+    if not RENDER_EXTERNAL_URL:
+        return
+        
+    while True:
+        try:
+            response = requests.get(f"{RENDER_EXTERNAL_URL}/ping", timeout=10)
+            if response.status_code == 200:
+                logger.info("🔔 Само-пинг выполнен успешно")
+            else:
+                logger.warning(f"⚠️ Само-пинг вернул статус {response.status_code}")
+        except Exception as e:
+            logger.error(f"❌ Ошибка само-пинга: {e}")
+        
+        # Ждем 10 минут до следующего пина
+        time.sleep(60)
+
 class AdminControlledReplyBot:
     def __init__(self):
         if not TELEGRAM_TOKEN:
@@ -59,6 +103,10 @@ class AdminControlledReplyBot:
         self.vk_api = None
         self.vk_upload = None
         self.init_vk_api()
+    
+    @property
+    def bot(self):
+        return self.tg_app.bot
     
     def get_db_connection(self):
         """Получаем соединение с PostgreSQL"""
@@ -1343,21 +1391,17 @@ class AdminControlledReplyBot:
         
         await update.message.reply_text(self.get_vk_token_message())
     
-    def run_bot(self):
-        """Запуск бота"""
-        try:
-            logger.info("🚀 Запуск бота...")
-            self.tg_app.run_polling(
-                drop_pending_updates=True,
-                allowed_updates=None,
-                close_loop=False
-            )
-        except Exception as e:
-            logger.error(f"❌ Ошибка бота: {e}")
-            raise
+    def setup_webhook(self):
+        """Настройка вебхука"""
+        if RENDER_EXTERNAL_URL:
+            webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
+            self.tg_app.bot.set_webhook(webhook_url)
+            logger.info(f"✅ Вебхук установлен: {webhook_url}")
+        else:
+            logger.warning("❌ RENDER_EXTERNAL_URL не установлен, вебхук не настроен")
 
 def run_flask_app():
-    """Запуск Flask приложения для health checks"""
+    """Запуск Flask приложения"""
     port = int(os.environ.get('PORT', 10000))
     logger.info(f"🌐 Запуск Flask сервера на порту {port}")
     app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
@@ -1365,30 +1409,48 @@ def run_flask_app():
 def signal_handler(signum, frame):
     """Обработчик сигналов для graceful shutdown"""
     logger.info(f"📞 Получен сигнал {signum}, завершаем работу...")
+    if bot_app:
+        # Удаляем вебхук при завершении
+        try:
+            bot_app.tg_app.bot.delete_webhook()
+            logger.info("✅ Вебхук удален")
+        except Exception as e:
+            logger.error(f"❌ Ошибка при удалении вебхука: {e}")
     sys.exit(0)
 
 def main():
     """Основная функция запуска"""
+    global bot_app, ping_thread
+    
     # Регистрируем обработчики сигналов
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
     
-    # Запускаем Flask в отдельном потоке
-    flask_thread = threading.Thread(target=run_flask_app)
-    flask_thread.daemon = True
-    flask_thread.start()
-    
-    logger.info("🚀 Flask сервер запущен для health checks")
-    
-    # Даем время завершиться предыдущему процессу
-    time.sleep(5)
-    
     try:
-        bot = AdminControlledReplyBot()
-        logger.info("🤖 Бот инициализирован, запускаем polling...")
-        bot.run_bot()
+        # Инициализируем бота
+        bot_app = AdminControlledReplyBot()
+        logger.info("🤖 Бот инициализирован")
+        
+        # Настраиваем вебхук
+        bot_app.setup_webhook()
+        
+        # Инициализируем приложение (без запуска polling)
+        bot_app.tg_app.initialize()
+        logger.info("✅ Приложение инициализировано")
+        
+        # Запускаем поток само-пингов (только если есть URL)
+        if RENDER_EXTERNAL_URL:
+            ping_thread = threading.Thread(target=ping_self, daemon=True)
+            ping_thread.start()
+            logger.info("🔔 Запущен само-пинг каждые 10 минут")
+        
+        # Запускаем Flask
+        logger.info("🚀 Запуск Flask сервера...")
+        run_flask_app()
+        
     except Exception as e:
         logger.error(f"❌ Критическая ошибка при запуске бота: {e}")
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
