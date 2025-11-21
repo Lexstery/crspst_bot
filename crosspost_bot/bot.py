@@ -9,92 +9,14 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 from vk_api import VkApi
 from vk_api.upload import VkUpload
 from io import BytesIO
-from flask import Flask, request
-import threading
-import signal
-import sys
-import requests
-
-# ==================== НАСТРОЙКИ ====================
-PING_INTERVAL_MINUTES = 1  # ⚠️ ИЗМЕНИТЕ ЗДЕСЬ: интервал само-пинга в минутах
-PING_INTERVAL_SECONDS = PING_INTERVAL_MINUTES * 60
-# ===================================================
 
 # Загружаем переменные окружения
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 VK_TOKEN = os.getenv('VK_TOKEN')
 DATABASE_URL = os.getenv('DATABASE_URL')
-RENDER_EXTERNAL_URL = os.getenv('RENDER_EXTERNAL_URL')
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-# Создаем Flask приложение
-app = Flask(__name__)
-
-# Глобальные переменные
-bot_app = None
-ping_thread = None
-
-@app.route('/')
-def home():
-    return "🤖 Telegram-VK Crossposting Bot is running!"
-
-@app.route('/health')
-def health():
-    return "✅ OK"
-
-@app.route('/status')
-def status():
-    return {
-        "status": "running",
-        "service": "telegram-vk-bot", 
-        "timestamp": time.time(),
-        "ping_interval_minutes": PING_INTERVAL_MINUTES
-    }
-
-@app.route('/ping')
-def ping():
-    """Эндпоинт для пингов от мониторинга"""
-    logger.info("🏓 Получен пинг")
-    return f"🏓 PONG | Self-ping every {PING_INTERVAL_MINUTES}min"
-
-@app.route('/webhook', methods=['POST'])
-def webhook():
-    """Эндпоинт для вебхуков от Telegram"""
-    if bot_app:
-        try:
-            update = Update.de_json(request.get_json(), bot_app.bot)
-            bot_app.process_update(update)
-            return "OK"
-        except Exception as e:
-            logger.error(f"❌ Ошибка обработки вебхука: {e}")
-            return "ERROR", 500
-    return "BOT_NOT_READY", 503
-
-def ping_self():
-    """Функция для само-пинга каждые N минут"""
-    if not RENDER_EXTERNAL_URL:
-        logger.warning("❌ RENDER_EXTERNAL_URL не установлен, само-пинг отключен")
-        return
-        
-    logger.info(f"🔔 Запущен само-пинг каждые {PING_INTERVAL_MINUTES} минут")
-    
-    while True:
-        try:
-            response = requests.get(f"{RENDER_EXTERNAL_URL}/ping", timeout=10)
-            if response.status_code == 200:
-                logger.info(f"🔔 Само-пинг выполнен успешно (интервал: {PING_INTERVAL_MINUTES} мин)")
-            else:
-                logger.warning(f"⚠️ Само-пинг вернул статус {response.status_code}")
-        except Exception as e:
-            logger.error(f"❌ Ошибка само-пинга: {e}")
-        
-        # Ждем указанное количество минут до следующего пина
-        time.sleep(PING_INTERVAL_SECONDS)
 
 class AdminControlledReplyBot:
     def __init__(self):
@@ -111,10 +33,6 @@ class AdminControlledReplyBot:
         self.vk_api = None
         self.vk_upload = None
         self.init_vk_api()
-    
-    @property
-    def bot(self):
-        return self.tg_app.bot
     
     def get_db_connection(self):
         """Получаем соединение с PostgreSQL"""
@@ -1399,69 +1317,40 @@ class AdminControlledReplyBot:
         
         await update.message.reply_text(self.get_vk_token_message())
     
-    def setup_webhook(self):
-        """Настройка вебхука"""
-        if RENDER_EXTERNAL_URL:
-            webhook_url = f"{RENDER_EXTERNAL_URL}/webhook"
-            self.tg_app.bot.set_webhook(webhook_url)
-            logger.info(f"✅ Вебхук установлен: {webhook_url}")
-        else:
-            logger.warning("❌ RENDER_EXTERNAL_URL не установлен, вебхук не настроен")
-
-def run_flask_app():
-    """Запуск Flask приложения"""
-    port = int(os.environ.get('PORT', 10000))
-    logger.info(f"🌐 Запуск Flask сервера на порту {port}")
-    app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
-
-def signal_handler(signum, frame):
-    """Обработчик сигналов для graceful shutdown"""
-    logger.info(f"📞 Получен сигнал {signum}, завершаем работу...")
-    if bot_app:
-        # Удаляем вебхук при завершении
-        try:
-            bot_app.tg_app.bot.delete_webhook()
-            logger.info("✅ Вебхук удален")
-        except Exception as e:
-            logger.error(f"❌ Ошибка при удалении вебхука: {e}")
-    sys.exit(0)
-
-def main():
-    """Основная функция запуска"""
-    global bot_app, ping_thread
-    
-    # Регистрируем обработчики сигналов
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-    
-    try:
-        # Инициализируем бота
-        bot_app = AdminControlledReplyBot()
-        logger.info("🤖 Бот инициализирован")
+    def run_with_retry(self, max_retries=3, initial_delay=10):
+        """Запуск бота с повторными попытками при конфликте"""
+        retries = 0
+        delay = initial_delay
         
-        # Настраиваем вебхук
-        bot_app.setup_webhook()
-        
-        # Инициализируем приложение (без запуска polling)
-        bot_app.tg_app.initialize()
-        logger.info("✅ Приложение инициализировано")
-        
-        # Запускаем поток само-пингов (только если есть URL)
-        if RENDER_EXTERNAL_URL:
-            ping_thread = threading.Thread(target=ping_self, daemon=True)
-            ping_thread.start()
-            logger.info(f"🔔 Запущен само-пинг каждые {PING_INTERVAL_MINUTES} минут")
-        else:
-            logger.warning("⚠️ RENDER_EXTERNAL_URL не установлен, само-пинг отключен")
-        
-        # Запускаем Flask
-        logger.info("🚀 Запуск Flask сервера...")
-        run_flask_app()
-        
-    except Exception as e:
-        logger.error(f"❌ Критическая ошибка при запуске бота: {e}")
-        sys.exit(1)
+        while retries < max_retries:
+            try:
+                logger.info(f"🚀 Запуск бота на Render.com (попытка {retries + 1}/{max_retries})...")
+                
+                self.tg_app.run_polling(
+                    drop_pending_updates=True,
+                    allowed_updates=None,
+                    close_loop=False
+                )
+                break
+                
+            except Exception as e:
+                retries += 1
+                error_msg = str(e)
+                
+                if "Conflict" in error_msg or "terminated by other getUpdates" in error_msg:
+                    logger.warning(f"🔄 Конфликт обнаружен, повтор через {delay} сек...")
+                    time.sleep(delay)
+                    delay *= 2
+                else:
+                    logger.error(f"❌ Критическая ошибка: {error_msg}")
+                    break
+                
+                if retries >= max_retries:
+                    logger.error("❌ Достигнут лимит попыток запуска")
+                    break
 
 if __name__ == "__main__":
-    main()
-
+    # Даем время завершиться предыдущему процессу
+    time.sleep(5)
+    bot = AdminControlledReplyBot()
+    bot.run_with_retry(max_retries=3, initial_delay=10)
