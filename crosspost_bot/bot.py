@@ -1088,16 +1088,16 @@ class AdminControlledReplyBot:
                     break
 
     async def cancel_setup(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Отмена процесса добавления канала"""
-    if 'setup_stage' in context.user_data:
-        context.user_data.clear()
-        await update.message.reply_text(
-            "❌ Процесс добавления канала отменен.",
-            reply_markup=ReplyKeyboardRemove()
-        )
-        await self.show_main_menu(update, context)
-    else:
-        await update.message.reply_text("❌ Нет активного процесса для отмены.")
+        """Отмена процесса добавления канала"""
+        if 'setup_stage' in context.user_data:
+            context.user_data.clear()
+            await update.message.reply_text(
+                "❌ Процесс добавления канала отменен.",
+                reply_markup=ReplyKeyboardRemove()
+            )
+            await self.show_main_menu(update, context)
+        else:
+            await update.message.reply_text("❌ Нет активного процесса для отмены.")
 
 
     async def show_new_channels(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1143,3 +1143,4 @@ if __name__ == "__main__":
     time.sleep(5)
     bot = AdminControlledReplyBot()
     bot.run_with_retry(max_retries=3, initial_delay=10)
+
