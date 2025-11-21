@@ -323,7 +323,7 @@ class AdminControlledReplyBot:
             # Пробуем извлечь из фрагмента URL
             fragment_match = re.search(r'#(.+)', input_text)
             if fragment_match:
-                fragment = fragment_match.group(1]
+                fragment = fragment_match.group(1)
                 token_match = re.search(r'access_token=([^&]+)', fragment)
                 if token_match:
                     return token_match.group(1)
@@ -1206,3 +1206,4 @@ if __name__ == "__main__":
     time.sleep(5)
     bot = AdminControlledReplyBot()
     bot.run_with_retry(max_retries=3, initial_delay=10)
+
