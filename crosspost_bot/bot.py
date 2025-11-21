@@ -1,18 +1,16 @@
 import logging
 import os
 import re
+import time
 from urllib.parse import unquote
+import psycopg
 from telegram import Update, InputFile, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from vk_api import VkApi
 from vk_api.upload import VkUpload
 from io import BytesIO
 
-# Загружаем .env только если не на Render
-if not os.getenv('RENDER'):
-    from dotenv import load_dotenv
-    load_dotenv()
-
+# Загружаем переменные окружения
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 VK_TOKEN = os.getenv('VK_TOKEN')
 DATABASE_URL = os.getenv('DATABASE_URL')
@@ -22,6 +20,11 @@ logger = logging.getLogger(__name__)
 
 class AdminControlledReplyBot:
     def __init__(self):
+        if not TELEGRAM_TOKEN:
+            raise ValueError("TELEGRAM_TOKEN не установлен")
+        if not DATABASE_URL:
+            raise ValueError("DATABASE_URL не установлен")
+            
         self.tg_app = Application.builder().token(TELEGRAM_TOKEN).build()
         self.setup_handlers()
         self.init_database()
@@ -32,26 +35,8 @@ class AdminControlledReplyBot:
         self.init_vk_api()
     
     def get_db_connection(self):
-        """Получаем соединение с базой данных"""
-        if DATABASE_URL:
-            # PostgreSQL на Render
-            try:
-                import psycopg
-                conn = psycopg.connect(DATABASE_URL)
-                self.db_type = 'postgresql'
-                return conn
-            except ImportError:
-                logger.error("psycopg не установлен, используем SQLite")
-        
-        # Локально SQLite (для разработки)
-        import sqlite3
-        if os.getenv('RENDER'):
-            db_path = '/tmp/bot.db'
-        else:
-            db_path = 'bot.db'
-        conn = sqlite3.connect(db_path)
-        self.db_type = 'sqlite'
-        return conn
+        """Получаем соединение с PostgreSQL"""
+        return psycopg.connect(DATABASE_URL)
     
     def setup_handlers(self):
         """Настройка обработчиков команд"""
@@ -77,106 +62,63 @@ class AdminControlledReplyBot:
             self.vk_upload = None
     
     def init_database(self):
-        """Инициализация базы данных"""
+        """Инициализация базы данных PostgreSQL"""
         conn = self.get_db_connection()
         cursor = conn.cursor()
         
         try:
-            if self.db_type == 'postgresql':
-                # PostgreSQL синтаксис
-                cursor.execute('''
-                    CREATE TABLE IF NOT EXISTS users (
-                        id SERIAL PRIMARY KEY,
-                        telegram_id BIGINT UNIQUE NOT NULL,
-                        username TEXT,
-                        first_name TEXT,
-                        is_admin BOOLEAN DEFAULT FALSE,
-                        is_approved BOOLEAN DEFAULT FALSE,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    )
-                ''')
-                
-                cursor.execute('''
-                    CREATE TABLE IF NOT EXISTS channels (
-                        id SERIAL PRIMARY KEY,
-                        name TEXT NOT NULL,
-                        telegram_channel TEXT NOT NULL,
-                        vk_group_id TEXT NOT NULL,
-                        created_by INTEGER,
-                        is_active BOOLEAN DEFAULT TRUE,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        FOREIGN KEY (created_by) REFERENCES users (id)
-                    )
-                ''')
-                
-                cursor.execute('''
-                    CREATE TABLE IF NOT EXISTS user_permissions (
-                        user_id INTEGER,
-                        channel_id INTEGER,
-                        can_post BOOLEAN DEFAULT TRUE,
-                        PRIMARY KEY (user_id, channel_id),
-                        FOREIGN KEY (user_id) REFERENCES users (id),
-                        FOREIGN KEY (channel_id) REFERENCES channels (id)
-                    )
-                ''')
-                
-                # Добавляем первого пользователя как администратора
-                cursor.execute(
-                    "INSERT INTO users (telegram_id, username, first_name, is_admin, is_approved) VALUES (%s, %s, %s, %s, %s) ON CONFLICT (telegram_id) DO NOTHING",
-                    (1258360028, "@sentsuro", "Андрей", True, True)
+            # Таблица пользователей с approved статусом
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS users (
+                    id SERIAL PRIMARY KEY,
+                    telegram_id BIGINT UNIQUE NOT NULL,
+                    username TEXT,
+                    first_name TEXT,
+                    is_admin BOOLEAN DEFAULT FALSE,
+                    is_approved BOOLEAN DEFAULT FALSE,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
-                
-            else:
-                # SQLite синтаксис
-                cursor.execute('''
-                    CREATE TABLE IF NOT EXISTS users (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        telegram_id INTEGER UNIQUE NOT NULL,
-                        username TEXT,
-                        first_name TEXT,
-                        is_admin BOOLEAN DEFAULT FALSE,
-                        is_approved BOOLEAN DEFAULT FALSE,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    )
-                ''')
-                
-                cursor.execute('''
-                    CREATE TABLE IF NOT EXISTS channels (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        name TEXT NOT NULL,
-                        telegram_channel TEXT NOT NULL,
-                        vk_group_id TEXT NOT NULL,
-                        created_by INTEGER,
-                        is_active BOOLEAN DEFAULT TRUE,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        FOREIGN KEY (created_by) REFERENCES users (id)
-                    )
-                ''')
-                
-                cursor.execute('''
-                    CREATE TABLE IF NOT EXISTS user_permissions (
-                        user_id INTEGER,
-                        channel_id INTEGER,
-                        can_post BOOLEAN DEFAULT TRUE,
-                        PRIMARY KEY (user_id, channel_id),
-                        FOREIGN KEY (user_id) REFERENCES users (id),
-                        FOREIGN KEY (channel_id) REFERENCES channels (id)
-                    )
-                ''')
-                
-                # Добавляем первого пользователя как администратора
-                cursor.execute(
-                    "INSERT OR IGNORE INTO users (telegram_id, username, first_name, is_admin, is_approved) VALUES (?, ?, ?, ?, ?)",
-                    (1258360028, "@sentsuro", "Андрей", True, True)
+            ''')
+            
+            # Таблица каналов
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS channels (
+                    id SERIAL PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    telegram_channel TEXT NOT NULL,
+                    vk_group_id TEXT NOT NULL,
+                    created_by INTEGER,
+                    is_active BOOLEAN DEFAULT TRUE,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (created_by) REFERENCES users (id)
                 )
+            ''')
+            
+            # Таблица прав доступа
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS user_permissions (
+                    user_id INTEGER,
+                    channel_id INTEGER,
+                    can_post BOOLEAN DEFAULT TRUE,
+                    PRIMARY KEY (user_id, channel_id),
+                    FOREIGN KEY (user_id) REFERENCES users (id),
+                    FOREIGN KEY (channel_id) REFERENCES channels (id)
+                )
+            ''')
+            
+            # Добавляем первого пользователя как администратора
+            cursor.execute(
+                "INSERT INTO users (telegram_id, username, first_name, is_admin, is_approved) VALUES (%s, %s, %s, %s, %s) ON CONFLICT (telegram_id) DO NOTHING",
+                (1258360028, "@sentsuro", "Андрей", True, True)
+            )
             
             conn.commit()
-            logger.info(f"✅ База данных {self.db_type.upper()} инициализирована")
+            logger.info("✅ База данных PostgreSQL инициализирована")
             
         except Exception as e:
             logger.error(f"❌ Ошибка инициализации базы данных: {e}")
-            if self.db_type == 'postgresql':
-                conn.rollback()
+            conn.rollback()
+            raise
         finally:
             cursor.close()
             conn.close()
@@ -203,8 +145,7 @@ class AdminControlledReplyBot:
             
         except Exception as e:
             logger.error(f"❌ Ошибка выполнения запроса: {e}")
-            if self.db_type == 'postgresql':
-                conn.rollback()
+            conn.rollback()
             return None
         finally:
             cursor.close()
@@ -212,11 +153,7 @@ class AdminControlledReplyBot:
     
     def get_user(self, telegram_id):
         """Получаем информацию о пользователе"""
-        if self.db_type == 'postgresql':
-            query = "SELECT id, username, first_name, is_admin, is_approved FROM users WHERE telegram_id = %s"
-        else:
-            query = "SELECT id, username, first_name, is_admin, is_approved FROM users WHERE telegram_id = ?"
-        
+        query = "SELECT id, username, first_name, is_admin, is_approved FROM users WHERE telegram_id = %s"
         result = self.execute_query(query, (telegram_id,))
         
         if result and result[0]:
@@ -232,11 +169,7 @@ class AdminControlledReplyBot:
     
     def register_user(self, telegram_id, username, first_name):
         """Регистрируем нового пользователя (не approved)"""
-        if self.db_type == 'postgresql':
-            query = "INSERT INTO users (telegram_id, username, first_name, is_approved) VALUES (%s, %s, %s, %s) ON CONFLICT (telegram_id) DO NOTHING"
-        else:
-            query = "INSERT OR IGNORE INTO users (telegram_id, username, first_name, is_approved) VALUES (?, ?, ?, ?)"
-        
+        query = "INSERT INTO users (telegram_id, username, first_name, is_approved) VALUES (%s, %s, %s, %s) ON CONFLICT (telegram_id) DO NOTHING"
         self.execute_query(query, (telegram_id, username, first_name, False))
         logger.info(f"✅ Зарегистрирован новый пользователь: {username}")
     
@@ -260,48 +193,29 @@ class AdminControlledReplyBot:
     
     def approve_user(self, telegram_id):
         """Одобряем пользователя и даем доступ ко всем каналам"""
-        if self.db_type == 'postgresql':
-            # Обновляем статус пользователя
-            self.execute_query(
-                "UPDATE users SET is_approved = TRUE WHERE telegram_id = %s",
-                (telegram_id,)
-            )
+        # Обновляем статус пользователя
+        self.execute_query(
+            "UPDATE users SET is_approved = TRUE WHERE telegram_id = %s",
+            (telegram_id,)
+        )
+        
+        # Получаем ID пользователя
+        user_result = self.execute_query("SELECT id FROM users WHERE telegram_id = %s", (telegram_id,))
+        
+        if user_result and user_result[0]:
+            user_id = user_result[0][0]
             
-            # Получаем ID пользователя
-            user_result = self.execute_query("SELECT id FROM users WHERE telegram_id = %s", (telegram_id,))
+            # Получаем все активные каналы
+            channels_result = self.execute_query("SELECT id FROM channels WHERE is_active = TRUE")
             
-            if user_result and user_result[0]:
-                user_id = user_result[0][0]
-                
-                # Получаем все активные каналы
-                channels_result = self.execute_query("SELECT id FROM channels WHERE is_active = TRUE")
-                
-                # Даем доступ ко всем каналам
-                for channel in channels_result:
-                    self.execute_query(
-                        "INSERT INTO user_permissions (user_id, channel_id, can_post) VALUES (%s, %s, %s) ON CONFLICT (user_id, channel_id) DO UPDATE SET can_post = %s",
-                        (user_id, channel[0], True, True)
-                    )
-                
-                logger.info(f"✅ Пользователь {telegram_id} одобрен и получил доступ к {len(channels_result)} каналам")
-        else:
-            # SQLite версия
-            self.execute_query(
-                "UPDATE users SET is_approved = TRUE WHERE telegram_id = ?",
-                (telegram_id,)
-            )
+            # Даем доступ ко всем каналам
+            for channel in channels_result:
+                self.execute_query(
+                    "INSERT INTO user_permissions (user_id, channel_id, can_post) VALUES (%s, %s, %s) ON CONFLICT (user_id, channel_id) DO UPDATE SET can_post = %s",
+                    (user_id, channel[0], True, True)
+                )
             
-            user_result = self.execute_query("SELECT id FROM users WHERE telegram_id = ?", (telegram_id,))
-            
-            if user_result and user_result[0]:
-                user_id = user_result[0][0]
-                channels_result = self.execute_query("SELECT id FROM channels WHERE is_active = TRUE")
-                
-                for channel in channels_result:
-                    self.execute_query(
-                        "INSERT OR REPLACE INTO user_permissions (user_id, channel_id, can_post) VALUES (?, ?, ?)",
-                        (user_id, channel[0], True)
-                    )
+            logger.info(f"✅ Пользователь {telegram_id} одобрен и получил доступ к {len(channels_result)} каналам")
     
     def grant_access_to_all_users(self, channel_id):
         """Выдать доступ к новому каналу всем одобренным пользователям"""
@@ -309,38 +223,22 @@ class AdminControlledReplyBot:
         
         if users_result:
             for user in users_result:
-                if self.db_type == 'postgresql':
-                    self.execute_query(
-                        "INSERT INTO user_permissions (user_id, channel_id, can_post) VALUES (%s, %s, %s) ON CONFLICT (user_id, channel_id) DO UPDATE SET can_post = %s",
-                        (user[0], channel_id, True, True)
-                    )
-                else:
-                    self.execute_query(
-                        "INSERT OR REPLACE INTO user_permissions (user_id, channel_id, can_post) VALUES (?, ?, ?)",
-                        (user[0], channel_id, True)
-                    )
+                self.execute_query(
+                    "INSERT INTO user_permissions (user_id, channel_id, can_post) VALUES (%s, %s, %s) ON CONFLICT (user_id, channel_id) DO UPDATE SET can_post = %s",
+                    (user[0], channel_id, True, True)
+                )
             
             logger.info(f"✅ Все одобренные пользователи получили доступ к каналу {channel_id}")
     
     def get_user_channels(self, user_id):
         """Получаем каналы доступные пользователю"""
-        if self.db_type == 'postgresql':
-            query = '''
-                SELECT c.id, c.name, c.telegram_channel, c.vk_group_id 
-                FROM channels c
-                LEFT JOIN user_permissions up ON c.id = up.channel_id AND up.user_id = %s
-                WHERE c.is_active = TRUE AND (up.can_post = TRUE OR c.created_by = %s OR 
-                      (SELECT is_admin FROM users WHERE id = %s) = TRUE)
-            '''
-        else:
-            query = '''
-                SELECT c.id, c.name, c.telegram_channel, c.vk_group_id 
-                FROM channels c
-                LEFT JOIN user_permissions up ON c.id = up.channel_id AND up.user_id = ?
-                WHERE c.is_active = TRUE AND (up.can_post = TRUE OR c.created_by = ? OR 
-                      (SELECT is_admin FROM users WHERE id = ?) = TRUE)
-            '''
-        
+        query = '''
+            SELECT c.id, c.name, c.telegram_channel, c.vk_group_id 
+            FROM channels c
+            LEFT JOIN user_permissions up ON c.id = up.channel_id AND up.user_id = %s
+            WHERE c.is_active = TRUE AND (up.can_post = TRUE OR c.created_by = %s OR 
+                  (SELECT is_admin FROM users WHERE id = %s) = TRUE)
+        '''
         result = self.execute_query(query, (user_id, user_id, user_id))
         
         if result:
@@ -365,7 +263,7 @@ class AdminControlledReplyBot:
                 'vk_group_id': channel[3]
             } for channel in result]
         return []
-
+    
     def check_vk_token(self):
         """Проверка валидности VK токена"""
         if not self.vk_api:
@@ -381,34 +279,19 @@ class AdminControlledReplyBot:
     
     def get_vk_token_message(self):
         """Сообщение с инструкцией по получению нового токена"""
-        is_render = os.getenv('RENDER')
-        platform_info = "🚀 **Render.com**" if is_render else "💻 **Локальный сервер**"
-        
         token_message = (
-            f"🔑 **VK токен истек или невалиден!**\n\n"
-            f"Платформа: {platform_info}\n\n"
+            "🔑 **VK токен истек или невалиден!**\n\n"
             "Чтобы получить новый токен:\n\n"
             "1. **Перейди по ссылке:**\n"
             "https://oauth.vk.com/authorize?client_id=6121396&scope=photos,groups,wall,offline&redirect_uri=https://oauth.vk.com/blank.html&display=page&v=5.199&response_type=token\n\n"
             "2. **Скопируй токен из адресной строки** (часть между `access_token=` и `&expires_in`)\n\n"
+            "3. **Обнови токен командой:**\n"
+            "`/update_token ваш_новый_токен`\n\n"
+            "**Или просто отправь ссылку из адресной строки** - бот автоматически извлечет токен!\n\n"
+            "⚠️ **На Render.com токен обновляется только в памяти бота!**\n"
+            "После перезапуска сервиса нужно будет обновить токен снова.\n\n"
+            "Для постоянного хранения токена обновите переменную окружения в Dashboard Render."
         )
-        
-        if is_render:
-            token_message += (
-                "3. **Обнови токен командой:**\n"
-                "`/update_token ваш_новый_токен`\n\n"
-                "**Или просто отправь ссылку из адресной строки** - бот автоматически извлечет токен!\n\n"
-                "⚠️ **На Render.com токен обновляется только в памяти бота!**\n"
-                "После перезапуска сервиса нужно будет обновить токен снова.\n\n"
-                "Для постоянного хранения токена обновите переменную окружения в Dashboard Render."
-            )
-        else:
-            token_message += (
-                "3. **Обнови токен командой:**\n"
-                "`/update_token ваш_новый_токен`\n\n"
-                "**Или просто отправь ссылку из адресной строки** - бот автоматически извлечет токен!\n\n"
-                "Токен будет сохранен в файле .env"
-            )
         
         token_message += "\n\n📎 **Ссылка для копирования:**\n"
         token_message += "`https://oauth.vk.com/authorize?client_id=6121396&scope=photos,groups,wall,offline&redirect_uri=https://oauth.vk.com/blank.html&display=page&v=5.199&response_type=token`"
@@ -444,7 +327,7 @@ class AdminControlledReplyBot:
         return None
     
     def update_vk_token(self, new_token: str) -> bool:
-        """Обновляет VK токен в памяти и в файле .env (только если не на Render)"""
+        """Обновляет VK токен в памяти"""
         try:
             # Обновляем глобальную переменную
             global VK_TOKEN
@@ -453,50 +336,12 @@ class AdminControlledReplyBot:
             # Переинициализируем VK API
             self.init_vk_api()
             
-            # Обновляем в файле .env только если не на Render
-            if not os.getenv('RENDER'):
-                self.update_env_file(new_token)
-                logger.info("✅ VK токен обновлен в памяти и в .env файле")
-            else:
-                logger.info("✅ VK токен обновлен в памяти (Render.com)")
-            
+            logger.info("✅ VK токен обновлен в памяти (Render.com)")
             return True
             
         except Exception as e:
             logger.error(f"❌ Ошибка обновления токена: {e}")
             return False
-    
-    def update_env_file(self, new_token: str):
-        """Обновляет токен в файле .env (только для локального использования)"""
-        try:
-            # Читаем текущий файл
-            with open('.env', 'r', encoding='utf-8') as file:
-                lines = file.readlines()
-            
-            # Обновляем или добавляем VK_TOKEN
-            token_updated = False
-            new_lines = []
-            
-            for line in lines:
-                if line.startswith('VK_TOKEN='):
-                    new_lines.append(f'VK_TOKEN={new_token}\n')
-                    token_updated = True
-                else:
-                    new_lines.append(line)
-            
-            # Если токен не был найден, добавляем новую строку
-            if not token_updated:
-                new_lines.append(f'VK_TOKEN={new_token}\n')
-            
-            # Записываем обратно
-            with open('.env', 'w', encoding='utf-8') as file:
-                file.writelines(new_lines)
-                
-            logger.info("✅ Файл .env обновлен")
-            
-        except Exception as e:
-            logger.error(f"❌ Ошибка обновления .env файла: {e}")
-            raise
     
     async def update_token_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Команда для обновления VK токена через ссылку"""
@@ -509,25 +354,18 @@ class AdminControlledReplyBot:
         
         # Проверяем, есть ли ссылка в сообщении
         if not context.args:
-            is_render = os.getenv('RENDER')
-            platform_info = "Render.com" if is_render else "локальном сервере"
-            
             message = (
-                f"🔧 **Обновление VK токена**\n\n"
-                f"Платформа: {platform_info}\n\n"
+                "🔧 **Обновление VK токена**\n\n"
+                "Платформа: Render.com\n\n"
                 "Отправьте команду в формате:\n"
                 "`/update_token https://oauth.vk.com/blank.html#access_token=ваш_токен&expires_in=...`\n\n"
                 "Или просто отправьте новый токен:\n"
                 "`/update_token ваш_новый_токен`\n\n"
                 "Также можно просто отправить ссылку в чат - бот автоматически распознает токен!\n\n"
+                "⚠️ **Внимание:** На Render.com токен обновляется только в памяти бота.\n"
+                "После перезапуска сервиса потребуется обновить токен снова.\n\n"
+                "Для постоянного хранения обновите переменную окружения в Dashboard Render."
             )
-            
-            if is_render:
-                message += (
-                    "⚠️ **Внимание:** На Render.com токен обновляется только в памяти бота.\n"
-                    "После перезапуска сервиса потребуется обновить токен снова.\n\n"
-                    "Для постоянного хранения обновите переменную окружения в Dashboard Render."
-                )
             
             await update.message.reply_text(message)
             return
@@ -547,25 +385,16 @@ class AdminControlledReplyBot:
         
         # Обновляем токен
         if self.update_vk_token(new_token):
-            is_render = os.getenv('RENDER')
-            
             message = (
                 f"✅ VK токен успешно обновлен!\n\n"
                 f"Токен: `{new_token[:15]}...{new_token[-10:]}`\n"
                 f"Длина токена: {len(new_token)} символов\n\n"
                 f"Статус VK: {'✅ Работает' if self.check_vk_token() else '❌ Ошибка'}\n\n"
+                "⚠️ **Токен обновлен только в памяти бота**\n"
+                "После перезапуска сервиса на Render.com потребуется обновить токен снова.\n\n"
+                "Для постоянного хранения обновите переменную `VK_TOKEN` в Dashboard Render.\n\n"
+                "Проверьте статус: /status"
             )
-            
-            if is_render:
-                message += (
-                    "⚠️ **Токен обновлен только в памяти бота**\n"
-                    "После перезапуска сервиса на Render.com потребуется обновить токен снова.\n\n"
-                    "Для постоянного хранения обновите переменную `VK_TOKEN` в Dashboard Render.\n\n"
-                )
-            else:
-                message += "✅ Токен сохранен в файл .env\n\n"
-            
-            message += "Проверьте статус: /status"
             
             await update.message.reply_text(message)
         else:
@@ -587,24 +416,15 @@ class AdminControlledReplyBot:
             
             if new_token:
                 if self.update_vk_token(new_token):
-                    is_render = os.getenv('RENDER')
-                    
                     message = (
                         f"✅ VK токен автоматически обновлен!\n\n"
                         f"Токен: `{new_token[:15]}...{new_token[-10:]}`\n"
                         f"Длина токена: {len(new_token)} символов\n\n"
                         f"Статус VK: {'✅ Работает' if self.check_vk_token() else '❌ Ошибка'}\n\n"
+                        "⚠️ **Токен обновлен только в памяти бота**\n"
+                        "После перезапуска сервиса потребуется обновить токен снова.\n\n"
+                        "Проверьте статус: /status"
                     )
-                    
-                    if is_render:
-                        message += (
-                            "⚠️ **Токен обновлен только в памяти бота**\n"
-                            "После перезапуска сервиса потребуется обновить токен снова.\n\n"
-                        )
-                    else:
-                        message += "✅ Токен сохранен в файл .env\n\n"
-                    
-                    message += "Проверьте статус: /status"
                     
                     await update.message.reply_text(message)
                 else:
@@ -668,12 +488,10 @@ class AdminControlledReplyBot:
         
         role_text = "👑 Администратор" if user_info['is_admin'] else "👤 Пользователь"
         vk_status = "✅" if self.check_vk_token() else "❌"
-        is_render = os.getenv('RENDER')
-        platform_info = "🚀 Render.com" if is_render else "💻 Локальный"
         
         message = (
             f"🎯 **Главное меню**\n\n"
-            f"Платформа: {platform_info}\n"
+            f"Платформа: 🚀 Render.com\n"
             f"Роль: {role_text}\n"
             f"Имя: {user_info['first_name']}\n"
             f"VK: {vk_status}\n\n"
@@ -955,36 +773,18 @@ class AdminControlledReplyBot:
                 user = update.effective_user
                 user_info = self.get_user(user.id)
                 
-                if self.db_type == 'postgresql':
-                    result = self.execute_query(
-                        "INSERT INTO channels (name, telegram_channel, vk_group_id, created_by) VALUES (%s, %s, %s, %s) RETURNING id",
-                        (user_data['new_channel_name'], user_data['new_telegram_channel'], user_data['new_vk_group_id'], user_info['id'])
-                    )
-                    channel_id = result[0][0] if result else None
-                else:
-                    conn = self.get_db_connection()
-                    cursor = conn.cursor()
-                    cursor.execute(
-                        "INSERT INTO channels (name, telegram_channel, vk_group_id, created_by) VALUES (?, ?, ?, ?)",
-                        (user_data['new_channel_name'], user_data['new_telegram_channel'], user_data['new_vk_group_id'], user_info['id'])
-                    )
-                    channel_id = cursor.lastrowid
-                    conn.commit()
-                    cursor.close()
-                    conn.close()
+                result = self.execute_query(
+                    "INSERT INTO channels (name, telegram_channel, vk_group_id, created_by) VALUES (%s, %s, %s, %s) RETURNING id",
+                    (user_data['new_channel_name'], user_data['new_telegram_channel'], user_data['new_vk_group_id'], user_info['id'])
+                )
+                channel_id = result[0][0] if result else None
                 
                 if channel_id:
                     # Автоматически даем доступ создателю
-                    if self.db_type == 'postgresql':
-                        self.execute_query(
-                            "INSERT INTO user_permissions (user_id, channel_id, can_post) VALUES (%s, %s, %s) ON CONFLICT (user_id, channel_id) DO UPDATE SET can_post = %s",
-                            (user_info['id'], channel_id, True, True)
-                        )
-                    else:
-                        self.execute_query(
-                            "INSERT OR REPLACE INTO user_permissions (user_id, channel_id, can_post) VALUES (?, ?, ?)",
-                            (user_info['id'], channel_id, True)
-                        )
+                    self.execute_query(
+                        "INSERT INTO user_permissions (user_id, channel_id, can_post) VALUES (%s, %s, %s) ON CONFLICT (user_id, channel_id) DO UPDATE SET can_post = %s",
+                        (user_info['id'], channel_id, True, True)
+                    )
                     
                     # Даем доступ к новому каналу всем одобренным пользователям
                     self.grant_access_to_all_users(channel_id)
@@ -1006,10 +806,6 @@ class AdminControlledReplyBot:
                     "❌ Ошибка при добавлении канала. Попробуйте снова.",
                     reply_markup=reply_markup
                 )
-                
-            finally:
-                cursor.close()
-                conn.close()
     
     async def show_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Показать помощь"""
@@ -1179,31 +975,19 @@ class AdminControlledReplyBot:
             await update.message.reply_text("❌ Эта команда только для администраторов")
             return
         
-        conn = self.get_db_connection()
-        cursor = conn.cursor()
+        result = self.execute_query("SELECT username, first_name FROM users WHERE is_admin = TRUE")
         
-        try:
-            cursor.execute("SELECT username, first_name FROM users WHERE is_admin = TRUE")
-            admins = cursor.fetchall()
-            
-            if not admins:
-                message = "❌ Нет администраторов"
-            else:
-                message = "👑 Список администраторов:\n\n"
-                for admin in admins:
-                    message += f"• {admin[1]} (@{admin[0]})\n"
-            
-            keyboard = [["🔙 Назад в меню"]]
-            reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-            
-            await update.message.reply_text(message, reply_markup=reply_markup)
-            
-        except Exception as e:
-            logger.error(f"❌ Ошибка получения списка админов: {e}")
-            await update.message.reply_text("❌ Ошибка получения списка администраторов")
-        finally:
-            cursor.close()
-            conn.close()
+        if not result:
+            message = "❌ Нет администраторов"
+        else:
+            message = "👑 Список администраторов:\n\n"
+            for admin in result:
+                message += f"• {admin[1]} (@{admin[0]})\n"
+        
+        keyboard = [["🔙 Назад в меню"]]
+        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+        
+        await update.message.reply_text(message, reply_markup=reply_markup)
 
     async def start_add_admin(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Начало процесса добавления администратора"""
@@ -1229,12 +1013,10 @@ class AdminControlledReplyBot:
         """Показать статус подключений"""
         vk_status = "✅ Работает" if self.check_vk_token() else "❌ Истек/Невалиден"
         tg_status = "✅ Работает"
-        is_render = os.getenv('RENDER')
-        platform = "🚀 Render.com" if is_render else "💻 Локальный сервер"
         
         message = (
             f"📊 **Статус бота**\n\n"
-            f"Платформа: {platform}\n"
+            f"Платформа: 🚀 Render.com\n"
             f"Telegram API: {tg_status}\n"
             f"VK API: {vk_status}\n\n"
         )
@@ -1243,9 +1025,7 @@ class AdminControlledReplyBot:
             message += self.get_vk_token_message()
         else:
             message += "Все системы работают нормально! 🚀"
-            
-            if is_render:
-                message += "\n\n⚠️ **На Render.com токен хранится в памяти**\nПри перезапуске сервиса потребуется обновить токен снова."
+            message += "\n\n⚠️ **На Render.com токен хранится в памяти**\nПри перезапуске сервиса потребуется обновить токен снова."
 
         await update.message.reply_text(message)
     
@@ -1260,12 +1040,40 @@ class AdminControlledReplyBot:
         
         await update.message.reply_text(self.get_vk_token_message())
     
-    def run(self):
-        is_render = os.getenv('RENDER')
-        platform = "Render.com" if is_render else "локальном сервере"
-        logger.info(f"Бот запущен на {platform}...")
-        self.tg_app.run_polling()
+    def run_with_retry(self, max_retries=3, initial_delay=10):
+        """Запуск бота с повторными попытками при конфликте"""
+        retries = 0
+        delay = initial_delay
+        
+        while retries < max_retries:
+            try:
+                logger.info(f"🚀 Запуск бота на Render.com (попытка {retries + 1}/{max_retries})...")
+                
+                self.tg_app.run_polling(
+                    drop_pending_updates=True,
+                    allowed_updates=None,
+                    close_loop=False
+                )
+                break
+                
+            except Exception as e:
+                retries += 1
+                error_msg = str(e)
+                
+                if "Conflict" in error_msg or "terminated by other getUpdates" in error_msg:
+                    logger.warning(f"🔄 Конфликт обнаружен, повтор через {delay} сек...")
+                    time.sleep(delay)
+                    delay *= 2
+                else:
+                    logger.error(f"❌ Критическая ошибка: {error_msg}")
+                    break
+                
+                if retries >= max_retries:
+                    logger.error("❌ Достигнут лимит попыток запуска")
+                    break
 
 if __name__ == "__main__":
+    # Даем время завершиться предыдущему процессу
+    time.sleep(5)
     bot = AdminControlledReplyBot()
-    bot.run()
+    bot.run_with_retry(max_retries=3, initial_delay=10)
