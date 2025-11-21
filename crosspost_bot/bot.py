@@ -9,7 +9,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 from vk_api import VkApi
 from vk_api.upload import VkUpload
 from io import BytesIO
-from flask import Flask, request
+from flask import Flask
 import threading
 import asyncio
 import signal
@@ -1347,8 +1347,8 @@ class AdminControlledReplyBot:
         
         await update.message.reply_text(self.get_vk_token_message())
     
-    async def run_bot(self):
-        """Запуск бота с обработкой graceful shutdown"""
+    def run_bot(self):
+        """Запуск бота в синхронном режиме"""
         retries = 0
         max_retries = 3
         initial_delay = 10
@@ -1357,7 +1357,8 @@ class AdminControlledReplyBot:
             try:
                 logger.info(f"🚀 Запуск бота на Render.com (попытка {retries + 1}/{max_retries})...")
                 
-                await self.tg_app.run_polling(
+                # Используем синхронный run_polling
+                self.tg_app.run_polling(
                     drop_pending_updates=True,
                     allowed_updates=None,
                     close_loop=False
@@ -1370,13 +1371,13 @@ class AdminControlledReplyBot:
                 
                 if "Conflict" in error_msg or "terminated by other getUpdates" in error_msg:
                     logger.warning(f"🔄 Конфликт обнаружен, повтор через {initial_delay} сек...")
-                    await asyncio.sleep(initial_delay)
+                    time.sleep(initial_delay)
                     initial_delay *= 2
                 else:
                     logger.error(f"❌ Критическая ошибка: {error_msg}")
                     if retries < max_retries:
                         logger.info(f"🔄 Перезапуск через {initial_delay} сек...")
-                        await asyncio.sleep(initial_delay)
+                        time.sleep(initial_delay)
                         initial_delay *= 2
                     else:
                         logger.error("❌ Достигнут лимит попыток запуска")
@@ -1400,13 +1401,13 @@ def signal_handler(signum, frame):
         globals()['bot'].stop()
     sys.exit(0)
 
-async def main():
+def main():
     """Основная функция запуска"""
     # Регистрируем обработчики сигналов
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
     
-    # Запускаем Flask в отдельном потоке (не демон)
+    # Запускаем Flask в отдельном потоке
     flask_thread = threading.Thread(target=run_flask_app)
     flask_thread.daemon = True
     flask_thread.start()
@@ -1414,15 +1415,15 @@ async def main():
     logger.info("🚀 Flask сервер запущен для health checks")
     
     # Даем время завершиться предыдущему процессу
-    await asyncio.sleep(5)
+    time.sleep(5)
     
     try:
         global bot
         bot = AdminControlledReplyBot()
         logger.info("🤖 Бот инициализирован, запускаем polling...")
-        await bot.run_bot()
+        bot.run_bot()
     except Exception as e:
         logger.error(f"❌ Критическая ошибка при запуске бота: {e}")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
