@@ -59,9 +59,6 @@ class AdminControlledReplyBot:
         self.vk_api = None
         self.vk_upload = None
         self.init_vk_api()
-        
-        # Флаг для graceful shutdown
-        self.is_running = True
     
     def get_db_connection(self):
         """Получаем соединение с PostgreSQL"""
@@ -1346,61 +1343,18 @@ class AdminControlledReplyBot:
         
         await update.message.reply_text(self.get_vk_token_message())
     
-    def run_bot_forever(self):
-        """Запуск бота в бесконечном цикле с перезапуском при ошибках"""
-        restart_count = 0
-        max_restarts_per_hour = 10
-        last_restart_time = time.time()
-        
-        while self.is_running:
-            try:
-                current_time = time.time()
-                # Сбрасываем счетчик рестартов если прошло больше часа
-                if current_time - last_restart_time > 3600:
-                    restart_count = 0
-                    last_restart_time = current_time
-                
-                if restart_count >= max_restarts_per_hour:
-                    logger.error(f"❌ Достигнут лимит рестартов ({max_restarts_per_hour} в час). Остановка.")
-                    break
-                
-                logger.info(f"🚀 Запуск бота (попытка {restart_count + 1})...")
-                
-                # Запускаем бота
-                self.tg_app.run_polling(
-                    drop_pending_updates=True,
-                    allowed_updates=None,
-                    close_loop=False
-                )
-                
-                # Если бот завершился без ошибки, ждем перед перезапуском
-                logger.warning("🔄 Бот завершил работу, перезапуск через 10 секунд...")
-                time.sleep(10)
-                
-            except Exception as e:
-                restart_count += 1
-                error_msg = str(e)
-                logger.error(f"❌ Ошибка бота: {error_msg}")
-                
-                if "Conflict" in error_msg or "terminated by other getUpdates" in error_msg:
-                    logger.warning("🔄 Конфликт обнаружен, перезапуск через 30 секунд...")
-                    time.sleep(30)
-                else:
-                    logger.warning("🔄 Перезапуск через 60 секунд...")
-                    time.sleep(60)
-            
-            finally:
-                # Всегда пытаемся остановить приложение перед перезапуском
-                try:
-                    if self.tg_app.running:
-                        self.tg_app.stop()
-                except:
-                    pass
-
-    def stop(self):
-        """Остановка бота"""
-        self.is_running = False
-        logger.info("🛑 Остановка бота...")
+    def run_bot(self):
+        """Запуск бота"""
+        try:
+            logger.info("🚀 Запуск бота...")
+            self.tg_app.run_polling(
+                drop_pending_updates=True,
+                allowed_updates=None,
+                close_loop=False
+            )
+        except Exception as e:
+            logger.error(f"❌ Ошибка бота: {e}")
+            raise
 
 def run_flask_app():
     """Запуск Flask приложения для health checks"""
@@ -1411,8 +1365,6 @@ def run_flask_app():
 def signal_handler(signum, frame):
     """Обработчик сигналов для graceful shutdown"""
     logger.info(f"📞 Получен сигнал {signum}, завершаем работу...")
-    if 'bot' in globals():
-        globals()['bot'].stop()
     sys.exit(0)
 
 def main():
@@ -1432,10 +1384,9 @@ def main():
     time.sleep(5)
     
     try:
-        global bot
         bot = AdminControlledReplyBot()
-        logger.info("🤖 Бот инициализирован, запускаем вечный polling...")
-        bot.run_bot_forever()
+        logger.info("🤖 Бот инициализирован, запускаем polling...")
+        bot.run_bot()
     except Exception as e:
         logger.error(f"❌ Критическая ошибка при запуске бота: {e}")
 
