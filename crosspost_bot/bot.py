@@ -9,7 +9,26 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 from vk_api import VkApi
 from vk_api.upload import VkUpload
 from io import BytesIO
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import threading
 
+class PingHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b'OK')
+    
+    def log_message(self, format, *args):
+        pass  # Отключаем логирование
+
+def start_ping_server():
+    server = HTTPServer(('0.0.0.0', 8080), PingHandler)
+    server.serve_forever()
+
+# Запускаем в отдельном потоке
+ping_thread = threading.Thread(target=start_ping_server)
+ping_thread.daemon = True
+ping_thread.start()
 # Загружаем переменные окружения
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 VK_TOKEN = os.getenv('VK_TOKEN')
@@ -1354,3 +1373,4 @@ if __name__ == "__main__":
     time.sleep(5)
     bot = AdminControlledReplyBot()
     bot.run_with_retry(max_retries=3, initial_delay=10)
+
