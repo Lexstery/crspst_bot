@@ -7,8 +7,8 @@ from typing import Any
 from telegram import InputMediaPhoto
 from telegram.error import TelegramError
 
-from .database import Database
-from .services.vk_client import VKClient
+from crosspost_bot.database import Database
+from crosspost_bot.services.vk_client import VKClient
 
 LOGGER = logging.getLogger(__name__)
 
