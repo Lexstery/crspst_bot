@@ -16,6 +16,7 @@ class Settings:
     render: bool = False
     self_ping_url: Optional[str] = None
     flask_port: int = 8000
+    timezone: str = "UTC"
 
     @classmethod
     def load(cls) -> "Settings":
@@ -44,6 +45,7 @@ class Settings:
             self_ping_url=os.getenv("SELF_PING_URL")
             or os.getenv("RENDER_EXTERNAL_URL"),
             flask_port=int(os.getenv("PORT", "8000")),
+            timezone=os.getenv("TIMEZONE", "Europe/Moscow"),
         )
 
 
