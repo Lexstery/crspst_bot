@@ -1,3 +1,4 @@
+import atexit
 import logging
 import os
 import re
@@ -46,6 +47,7 @@ DATABASE_URL = os.getenv('DATABASE_URL')
 BOT_TIMEZONE = os.getenv('BOT_TIMEZONE', 'Europe/Moscow')
 SCHEDULE_POLL_INTERVAL = int(os.getenv('SCHEDULE_POLL_INTERVAL', '60'))
 MAX_PHOTOS_PER_POST = int(os.getenv('MAX_PHOTOS_PER_POST', '10'))
+LEADER_LOCK_ID = int(os.getenv('LEADER_LOCK_ID', '20231123'))
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -63,6 +65,9 @@ class AdminControlledReplyBot:
         except Exception:
             self.timezone = ZoneInfo("UTC")
             logger.warning(f"⚠️ Некорректный BOT_TIMEZONE={BOT_TIMEZONE}, используем UTC")
+        
+        self.leader_lock_conn = None
+        self.leader_lock_id = LEADER_LOCK_ID
             
         self.tg_app = Application.builder().token(TELEGRAM_TOKEN).build()
         self.setup_handlers()
@@ -190,6 +195,50 @@ class AdminControlledReplyBot:
         finally:
             cursor.close()
             conn.close()
+    
+    def acquire_leader_lock(self, retry_delay=5):
+        """Гарантируем, что только один экземпляр бота получает обновления"""
+        if self.leader_lock_conn:
+            return
+        
+        while True:
+            try:
+                conn = psycopg.connect(DATABASE_URL)
+                conn.autocommit = True
+                cur = conn.cursor()
+                cur.execute("SELECT pg_try_advisory_lock(%s)", (self.leader_lock_id,))
+                got_lock = cur.fetchone()[0]
+                cur.close()
+                
+                if got_lock:
+                    self.leader_lock_conn = conn
+                    atexit.register(self.release_leader_lock)
+                    logger.info(f"✅ Получен лидер-лок {self.leader_lock_id}, стартуем polling")
+                    break
+                
+                conn.close()
+                logger.warning("⏳ Другой экземпляр бота уже запущен. Ждем освобождения блокировки...")
+                time.sleep(retry_delay)
+            
+            except Exception as e:
+                logger.error(f"❌ Ошибка получения лидер-лока: {e}")
+                time.sleep(retry_delay)
+    
+    def release_leader_lock(self):
+        """Освобождаем advisory lock"""
+        if not self.leader_lock_conn:
+            return
+        
+        try:
+            cur = self.leader_lock_conn.cursor()
+            cur.execute("SELECT pg_advisory_unlock(%s)", (self.leader_lock_id,))
+            cur.close()
+            self.leader_lock_conn.close()
+            logger.info("🔓 Лидер-лок освобожден")
+        except Exception as e:
+            logger.error(f"❌ Ошибка освобождения лидер-лока: {e}")
+        finally:
+            self.leader_lock_conn = None
     
     def execute_query(self, query, params=None):
         """Универсальный метод выполнения запросов"""
@@ -928,7 +977,8 @@ class AdminControlledReplyBot:
                 ["📢 Опубликовать пост", "📋 Мои каналы"],
                 ["🆕 Новые каналы", "👥 Управление пользователями"],
                 ["⚙️ Управление каналами", "👑 Управление админами"],
-                ["ℹ️ Помощь", "❌ Скрыть меню"]
+                ["ℹ️ Помощь", "❌ Скрыть меню"],
+                ["🛑 Остановить бота"]
             ]
         else:
             # Меню для обычного пользователя
@@ -1013,6 +1063,9 @@ class AdminControlledReplyBot:
         elif text == "🗑️ Удалить пользователя" and user_info['is_admin']:
             await self.start_delete_user(update, context)
         
+        elif text == "🛑 Остановить бота" and user_info['is_admin']:
+            await self.request_shutdown(update, context)
+        
         elif text == "ℹ️ Помощь":
             await self.show_help(update, context)
         
@@ -1053,6 +1106,14 @@ class AdminControlledReplyBot:
         
         elif text == "❌ Отменить планирование" and context.user_data.get('schedule_stage') == 'awaiting_datetime':
             await self.cancel_schedule_flow(update, context)
+        
+        elif text == "✅ Подтвердить остановку" and context.user_data.get('shutdown_stage') == 'confirm_shutdown':
+            await self.confirm_shutdown(update, context)
+        
+        elif text == "❌ Отмена остановки" and context.user_data.get('shutdown_stage'):
+            context.user_data.pop('shutdown_stage', None)
+            await update.message.reply_text("Остановка отменена.", reply_markup=ReplyKeyboardRemove())
+            await self.show_main_menu(update, context)
         
         # Обработка подтверждения добавления администратора
         elif text == "✅ Да, сделать администратором" and context.user_data.get('setup_stage') == 'confirm_admin_addition':
@@ -1596,6 +1657,32 @@ class AdminControlledReplyBot:
         
         await update.message.reply_text(message, reply_markup=reply_markup)
     
+    async def request_shutdown(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Запрашиваем подтверждение остановки бота"""
+        user_info = self.get_user(update.effective_user.id)
+        if not user_info or not user_info['is_admin']:
+            await update.message.reply_text("❌ Эта команда доступна только администраторам.")
+            return
+        
+        context.user_data['shutdown_stage'] = 'confirm_shutdown'
+        keyboard = [
+            ["✅ Подтвердить остановку"],
+            ["❌ Отмена остановки"]
+        ]
+        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+        await update.message.reply_text(
+            "⚠️ Вы собираетесь остановить бота.\n\n"
+            "Render автоматически перезапустит сервис, но текущее подключение к Telegram будет завершено.\n\n"
+            "Подтвердите действие:",
+            reply_markup=reply_markup
+        )
+    
+    async def confirm_shutdown(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Подтверждение остановки бота"""
+        context.user_data.pop('shutdown_stage', None)
+        await update.message.reply_text("⏳ Завершаю работу бота...", reply_markup=ReplyKeyboardRemove())
+        await context.application.stop()
+    
     async def handle_photo(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Добавление фото в черновик"""
         user = update.effective_user
@@ -1860,35 +1947,39 @@ class AdminControlledReplyBot:
     
     def run_with_retry(self, max_retries=3, initial_delay=10):
         """Запуск бота с повторными попытками при конфликте"""
+        self.acquire_leader_lock()
         retries = 0
         delay = initial_delay
         
-        while retries < max_retries:
-            try:
-                logger.info(f"🚀 Запуск бота на Render.com (попытка {retries + 1}/{max_retries})...")
-                
-                self.tg_app.run_polling(
-                    drop_pending_updates=True,
-                    allowed_updates=None,
-                    close_loop=False
-                )
-                break
-                
-            except Exception as e:
-                retries += 1
-                error_msg = str(e)
-                
-                if "Conflict" in error_msg or "terminated by other getUpdates" in error_msg:
-                    logger.warning(f"🔄 Конфликт обнаружен, повтор через {delay} сек...")
-                    time.sleep(delay)
-                    delay *= 2
-                else:
-                    logger.error(f"❌ Критическая ошибка: {error_msg}")
+        try:
+            while retries < max_retries:
+                try:
+                    logger.info(f"🚀 Запуск бота на Render.com (попытка {retries + 1}/{max_retries})...")
+                    
+                    self.tg_app.run_polling(
+                        drop_pending_updates=True,
+                        allowed_updates=None,
+                        close_loop=False
+                    )
                     break
-                
-                if retries >= max_retries:
-                    logger.error("❌ Достигнут лимит попыток запуска")
-                    break
+                    
+                except Exception as e:
+                    retries += 1
+                    error_msg = str(e)
+                    
+                    if "Conflict" in error_msg or "terminated by other getUpdates" in error_msg:
+                        logger.warning(f"🔄 Конфликт Telegram getUpdates, повтор через {delay} сек...")
+                        time.sleep(delay)
+                        delay *= 2
+                    else:
+                        logger.error(f"❌ Критическая ошибка: {error_msg}")
+                        break
+                    
+                    if retries >= max_retries:
+                        logger.error("❌ Достигнут лимит попыток запуска")
+                        break
+        finally:
+            self.release_leader_lock()
 
 if __name__ == "__main__":
     # Даем время завершиться предыдущему процессу
