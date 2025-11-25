@@ -19,6 +19,12 @@ from telegram.ext import (
     filters,
 )
 
+if __package__ in {None, ""}:
+    import os
+    import sys
+
+    sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+
 from crosspost_bot.config import Settings
 from crosspost_bot.database import Database
 from crosspost_bot.keyboards import (
