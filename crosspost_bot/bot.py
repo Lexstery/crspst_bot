@@ -15,7 +15,6 @@ from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     ContextTypes,
-    MediaGroupHandler,
     MessageHandler,
     filters,
 )
@@ -55,6 +54,9 @@ STATE_CHANNEL_ADD_TG = "channel_add_tg"
 STATE_CHANNEL_ADD_VK = "channel_add_vk"
 STATE_CHANNEL_DEACTIVATE = "channel_deactivate"
 STATE_CHANNEL_ACTIVATE = "channel_activate"
+
+ALBUM_CACHE_KEY = "album_cache"
+ALBUM_FLUSH_DELAY = 1.0
 STATE_MANAGE_USERS = "manage_users"
 STATE_MANAGE_ADMINS = "manage_admins"
 STATE_TOKEN_UPDATE = "token_update"
@@ -557,35 +559,65 @@ async def process_schedule_content(
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.message
+    if not message:
+        return
+    if message.media_group_id:
+        await _buffer_media_group(update, context)
+        return
     state = context.user_data.get("state")
-    media = build_media_payload(update.message)
+    media = build_media_payload(message)
     if state == STATE_POST_CONTENT:
-        await process_post_content(update, context, text=update.message.caption, media=media)
+        await process_post_content(update, context, text=message.caption, media=media)
     elif state == STATE_SCHEDULE_CONTENT:
-        await process_schedule_content(
-            update, context, text=update.message.caption, media=media
-        )
+        await process_schedule_content(update, context, text=message.caption, media=media)
+    else:
+        await message.reply_text("Отправьте команду из меню перед загрузкой медиа.")
+
+
+async def _buffer_media_group(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.message
+    if not message or not message.media_group_id:
+        return
+    cache = context.chat_data.setdefault(ALBUM_CACHE_KEY, {})
+    entry = cache.setdefault(
+        message.media_group_id,
+        {"media": [], "caption": None, "task": None, "state": None},
+    )
+    entry["media"].extend(build_media_payload(message))
+    if message.caption:
+        entry["caption"] = message.caption
+    entry["state"] = context.user_data.get("state")
+    task: asyncio.Task | None = entry.get("task")
+    if task:
+        task.cancel()
+    entry["task"] = context.application.create_task(
+        _finalize_media_group(update, context, message.media_group_id)
+    )
+
+
+async def _finalize_media_group(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, media_group_id: str
+) -> None:
+    try:
+        await asyncio.sleep(ALBUM_FLUSH_DELAY)
+    except asyncio.CancelledError:
+        return
+    cache = context.chat_data.get(ALBUM_CACHE_KEY, {})
+    entry = cache.pop(media_group_id, None)
+    if not entry:
+        return
+    state = entry.get("state")
+    caption = entry.get("caption")
+    media = entry.get("media", [])
+    if state == STATE_POST_CONTENT:
+        await process_post_content(update, context, text=caption, media=media)
+    elif state == STATE_SCHEDULE_CONTENT:
+        await process_schedule_content(update, context, text=caption, media=media)
     else:
         await update.message.reply_text(
             "Отправьте команду из меню перед загрузкой медиа."
         )
-
-
-async def handle_media_group(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    state = context.user_data.get("state")
-    messages: list[Message] = getattr(context, "media_group", None) or []
-    photo_payload = []
-    caption = None
-    for msg in messages:
-        photo_payload.extend(build_media_payload(msg))
-        if msg.caption:
-            caption = msg.caption
-    if state == STATE_POST_CONTENT:
-        await process_post_content(update, context, text=caption, media=photo_payload)
-    elif state == STATE_SCHEDULE_CONTENT:
-        await process_schedule_content(update, context, text=caption, media=photo_payload)
-    else:
-        await update.message.reply_text("Сначала выберите действие.")
 
 
 async def start_user_management(
@@ -831,9 +863,6 @@ def register_handlers(application) -> None:
     application.add_handler(CommandHandler("get_token", handle_get_token))
     application.add_handler(CommandHandler("update_token", handle_update_token))
     application.add_handler(CommandHandler("stop", handle_stop))
-    application.add_handler(
-        MediaGroupHandler(handle_media_group, filters.PHOTO & filters.ChatType.PRIVATE)
-    )
     application.add_handler(
         MessageHandler(filters.PHOTO & filters.ChatType.PRIVATE, handle_photo)
     )
