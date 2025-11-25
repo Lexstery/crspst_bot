@@ -4,5 +4,5 @@ start command: python crosspost_bot/bot.py
 
 env:
 	DATABASE_URL: postgresql://crosspost_bot_zjka_user:isH1gW5ejj8EFb0JvUYF81nfVQIcA1vA@dpg-d4ga4qidbo4c739t5ne0-a/crosspost_bot_zjka
-	TELEGRAM_TOKEN: 8202141159:AAELsbTI94hH7rLOXNcgafMXDfaAAIBespU
+	TELEGRAM_TOKEN: 8202141159:AAEb5ApuM_6FNonTenLf8fH8QjLlWZrM-YY
 	VK_TOKEN: vk1.a.lD9tFl2Rz8GerPaFIPUJzC9isEtGaO7zOlNVMOPEb_WmrFzLsFwhKy_v1PgK5Ycz6nFJngIk28hkh2gT43sE4LZEUhvuwEDy0qbh0oJOykjbXQNKOIe8-2aXaX0PkuUUVbW1kIoDkwyUmSZ-gTJ483OQXcYMrVtOEg5fcuDSfwS6WTXCPF7AnQAPMK3UC4mC2iDM7T1xGMMT9BVJmk7WvA
