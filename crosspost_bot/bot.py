@@ -47,9 +47,15 @@ class AdminControlledReplyBot:
         self.tg_app.add_handler(CommandHandler("get_token", self.get_token_command))
         self.tg_app.add_handler(CommandHandler("update_token", self.update_token_command))
         self.tg_app.add_handler(CommandHandler("stop", self.stop_bot))
-        self.tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_text_message_with_token))
+        
+        # Основной обработчик текстовых сообщений
+        self.tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_text_message))
+        
+        # Обработчик фото
         self.tg_app.add_handler(MessageHandler(filters.PHOTO, self.handle_photo))
-        self.tg_app.add_handler(MessageHandler(filters.ALL, self.handle_other_messages))
+        
+        # Обработчик ошибок
+        self.tg_app.add_error_handler(self.error_handler)
     
     def init_vk_api(self):
         """Инициализация VK API с обработкой ошибок"""
@@ -138,6 +144,18 @@ class AdminControlledReplyBot:
         conn.close()
         logger.info("✅ База данных инициализирована")
     
+    async def error_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик ошибок"""
+        logger.error(f"Ошибка: {context.error}", exc_info=context.error)
+        
+        if update and update.effective_message:
+            try:
+                await update.effective_message.reply_text(
+                    "❌ Произошла ошибка. Попробуйте еще раз или обратитесь к администратору."
+                )
+            except Exception as e:
+                logger.error(f"Ошибка при отправке сообщения об ошибке: {e}")
+
     def get_user(self, telegram_id):
         """Получаем информацию о пользователе"""
         conn = sqlite3.connect('bot.db')
@@ -532,52 +550,6 @@ class AdminControlledReplyBot:
         else:
             await update.message.reply_text("❌ Ошибка при обновлении токена")
     
-    async def handle_token_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработка сообщений с токенами (автоматическое определение)"""
-        user = update.effective_user
-        user_info = self.get_user(user.id)
-        
-        if not user_info or not user_info['is_admin']:
-            return
-        
-        text = update.message.text
-        
-        # Проверяем, содержит ли сообщение токен VK
-        if any(keyword in text for keyword in ['access_token=', 'oauth.vk.com']):
-            new_token = self.extract_token_from_input(text)
-            
-            if new_token:
-                if self.update_vk_token(new_token):
-                    is_render = os.getenv('RENDER')
-                    
-                    message = (
-                        f"✅ VK токен автоматически обновлен!\n\n"
-                        f"Токен: `{new_token[:15]}...{new_token[-10:]}`\n"
-                        f"Длина токена: {len(new_token)} символов\n\n"
-                        f"Статус VK: {'✅ Работает' if self.check_vk_token() else '❌ Ошибка'}\n\n"
-                    )
-                    
-                    if is_render:
-                        message += (
-                            "⚠️ **Токен обновлен только в памяти бота**\n"
-                            "После перезапуска сервиса потребуется обновить токен снова.\n\n"
-                        )
-                    else:
-                        message += "✅ Токен сохранен в файл .env\n\n"
-                    
-                    message += "Проверьте статус: /status"
-                    
-                    await update.message.reply_text(message)
-                else:
-                    await update.message.reply_text("❌ Ошибка при автоматическом обновлении токена")
-
-    async def handle_text_message_with_token(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Объединенный обработчик текстовых сообщений"""
-        # Сначала проверяем токен
-        await self.handle_token_message(update, context)
-        # Затем стандартная обработка
-        await self.handle_text_message(update, context)
-
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Регистрация/приветствие пользователя"""
         user = update.effective_user
@@ -660,6 +632,16 @@ class AdminControlledReplyBot:
         user = update.effective_user
         text = update.message.text
         
+        # Сначала проверяем токен VK
+        user_info = self.get_user(user.id)
+        if user_info and user_info['is_admin']:
+            if any(keyword in text for keyword in ['access_token=', 'oauth.vk.com']):
+                new_token = self.extract_token_from_input(text)
+                if new_token:
+                    if self.update_vk_token(new_token):
+                        await update.message.reply_text("✅ VK токен автоматически обновлен!")
+                    return
+        
         if not self.is_user_approved(user.id):
             await update.message.reply_text("❌ Доступ запрещен. Ожидайте одобрения администратора.")
             return
@@ -712,6 +694,9 @@ class AdminControlledReplyBot:
         elif text == "🗑️ Удалить пользователя" and user_info['is_admin']:
             await self.start_delete_user(update, context)
         
+        elif text == "➕ Добавить админа" and user_info['is_admin']:
+            await self.start_add_admin(update, context)
+        
         # Если это выбор канала для публикации
         elif text.startswith("📢 "):
             channel_name = text[2:]  # Убираем эмодзи
@@ -722,13 +707,14 @@ class AdminControlledReplyBot:
             channel_name = text[2:]  # Убираем эмодзи
             await self.select_channel_for_scheduling(update, context, channel_name)
         
+        # Если это выбор канала для удаления
+        elif text.startswith("🗑️ "):
+            channel_name = text[3:]  # Убираем эмодзи
+            await self.handle_channel_deletion(update, context, channel_name)
+        
         # Обработка процесса добавления канала
         elif 'setup_stage' in context.user_data:
             await self.handle_channel_setup(update, context, text)
-        
-        # Обработка процесса удаления канала
-        elif 'delete_channel_stage' in context.user_data:
-            await self.handle_channel_deletion(update, context, text)
         
         # Обработка процесса удаления пользователя
         elif 'delete_user_stage' in context.user_data:
@@ -750,32 +736,6 @@ class AdminControlledReplyBot:
             await update.message.reply_text(
                 "ℹ️ Используйте меню для навигации или /menu для показа меню"
             )
-    
-    async def handle_other_messages(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Обработка других типов сообщений"""
-        user = update.effective_user
-        
-        if not self.is_user_approved(user.id):
-            await update.message.reply_text("❌ Доступ запрещен. Ожидайте одобрения администратора.")
-            return
-        
-        # Если есть медиа группа (несколько фото)
-        if update.message.media_group_id:
-            if 'media_group' not in context.user_data:
-                context.user_data['media_group'] = {
-                    'id': update.message.media_group_id,
-                    'messages': []
-                }
-            
-            context.user_data['media_group']['messages'].append(update.message)
-            
-            # Если это первое сообщение в группе, сообщаем пользователю
-            if len(context.user_data['media_group']['messages']) == 1:
-                await update.message.reply_text("📸 Получена группа медиа. Отправьте все фото, затем текст для публикации.")
-        
-        # Если выбран канал и это не медиа группа
-        elif 'selected_channel' in context.user_data and not update.message.media_group_id:
-            await update.message.reply_text("❌ Для публикации используйте текст или фото.")
     
     async def show_publish_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Меню публикации"""
@@ -912,6 +872,8 @@ class AdminControlledReplyBot:
     async def handle_schedule_setup(self, update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
         """Обработка настройки отложенного поста"""
         stage = context.user_data['schedule_stage']
+        user = update.effective_user
+        user_info = self.get_user(user.id)
         
         if stage == 'awaiting_datetime':
             try:
@@ -1130,23 +1092,21 @@ class AdminControlledReplyBot:
             reply_markup=reply_markup
         )
     
-    async def handle_channel_deletion(self, update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
+    async def handle_channel_deletion(self, update: Update, context: ContextTypes.DEFAULT_TYPE, channel_name: str):
         """Обработка удаления канала"""
-        if text.startswith("🗑️ "):
-            channel_name = text[3:]  # Убираем эмодзи
-            channels = context.user_data['available_channels']
+        channels = context.user_data.get('available_channels', [])
+        
+        channel = next((ch for ch in channels if ch['name'] == channel_name), None)
+        
+        if channel:
+            self.delete_channel(channel['id'])
+            context.user_data.clear()
             
-            channel = next((ch for ch in channels if ch['name'] == channel_name), None)
-            
-            if channel:
-                self.delete_channel(channel['id'])
-                context.user_data.clear()
-                
-                await update.message.reply_text(
-                    f"✅ Канал '{channel_name}' успешно удален!"
-                )
-            else:
-                await update.message.reply_text("❌ Канал не найден.")
+            await update.message.reply_text(
+                f"✅ Канал '{channel_name}' успешно удален!"
+            )
+        else:
+            await update.message.reply_text("❌ Канал не найден.")
     
     async def handle_channel_setup(self, update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
         """Обработка процесса добавления канала"""
