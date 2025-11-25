@@ -1,88 +1,42 @@
-import atexit
 import logging
-import os
+import sqlite3
 import re
-import time
-from datetime import datetime, timedelta, timezone
-from typing import List, Optional
+import os
+import asyncio
+from datetime import datetime, timedelta
 from urllib.parse import unquote
-from zoneinfo import ZoneInfo
-
-import psycopg
-from telegram import (
-    InputMediaPhoto,
-    ReplyKeyboardMarkup,
-    ReplyKeyboardRemove,
-    Update,
-)
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram import Update, InputFile, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackContext
 from vk_api import VkApi
 from vk_api.upload import VkUpload
 from io import BytesIO
-from http.server import HTTPServer, BaseHTTPRequestHandler
-import threading
+import json
 
-class PingHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b'OK')
-    
-    def log_message(self, format, *args):
-        pass  # Отключаем логирование
+# Загружаем .env только если не на Render
+if not os.getenv('RENDER'):
+    from dotenv import load_dotenv
+    load_dotenv()
 
-def start_ping_server():
-    port = int(os.environ.get("PORT", "8080"))
-    server = HTTPServer(('0.0.0.0', port), PingHandler)
-    server.serve_forever()
-
-# Запускаем в отдельном потоке
-ping_thread = threading.Thread(target=start_ping_server)
-ping_thread.daemon = True
-ping_thread.start()
-# Загружаем переменные окружения
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 VK_TOKEN = os.getenv('VK_TOKEN')
-DATABASE_URL = os.getenv('DATABASE_URL')
-BOT_TIMEZONE = os.getenv('BOT_TIMEZONE', 'Europe/Moscow')
-SCHEDULE_POLL_INTERVAL = int(os.getenv('SCHEDULE_POLL_INTERVAL', '60'))
-MAX_PHOTOS_PER_POST = int(os.getenv('MAX_PHOTOS_PER_POST', '10'))
-LEADER_LOCK_ID = int(os.getenv('LEADER_LOCK_ID', '20231123'))
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 class AdminControlledReplyBot:
     def __init__(self):
-        if not TELEGRAM_TOKEN:
-            raise ValueError("TELEGRAM_TOKEN не установлен")
-        if not DATABASE_URL:
-            raise ValueError("DATABASE_URL не установлен")
-
-        try:
-            self.timezone = ZoneInfo(BOT_TIMEZONE)
-            logger.info(f"🕒 Используем часовой пояс: {BOT_TIMEZONE}")
-        except Exception:
-            self.timezone = ZoneInfo("UTC")
-            logger.warning(f"⚠️ Некорректный BOT_TIMEZONE={BOT_TIMEZONE}, используем UTC")
-        
-        self.leader_lock_conn = None
-        self.leader_lock_id = LEADER_LOCK_ID
-            
         self.tg_app = Application.builder().token(TELEGRAM_TOKEN).build()
         self.setup_handlers()
         self.init_database()
+        self.scheduled_posts = {}
         
         # Инициализируем VK с обработкой ошибок
         self.vk_api = None
         self.vk_upload = None
         self.init_vk_api()
-        self.scheduler_job = None
-        self.start_scheduler()
-    
-    def get_db_connection(self):
-        """Получаем соединение с PostgreSQL"""
-        return psycopg.connect(DATABASE_URL)
     
     def setup_handlers(self):
         """Настройка обработчиков команд"""
@@ -92,216 +46,133 @@ class AdminControlledReplyBot:
         self.tg_app.add_handler(CommandHandler("status", self.status_command))
         self.tg_app.add_handler(CommandHandler("get_token", self.get_token_command))
         self.tg_app.add_handler(CommandHandler("update_token", self.update_token_command))
+        self.tg_app.add_handler(CommandHandler("stop", self.stop_bot))
         self.tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_text_message_with_token))
         self.tg_app.add_handler(MessageHandler(filters.PHOTO, self.handle_photo))
+        self.tg_app.add_handler(MessageHandler(filters.ALL, self.handle_other_messages))
     
     def init_vk_api(self):
         """Инициализация VK API с обработкой ошибок"""
         try:
-            self.vk_session = VkApi(token=VK_TOKEN)
-            self.vk_api = self.vk_session.get_api()
-            self.vk_upload = VkUpload(self.vk_session)
-            logger.info("✅ VK API инициализирован")
+            if VK_TOKEN:
+                self.vk_session = VkApi(token=VK_TOKEN)
+                self.vk_api = self.vk_session.get_api()
+                self.vk_upload = VkUpload(self.vk_session)
+                logger.info("✅ VK API инициализирован")
+            else:
+                logger.warning("⚠️ VK_TOKEN не установлен")
+                self.vk_api = None
+                self.vk_upload = None
         except Exception as e:
             logger.error(f"❌ Ошибка VK API: {e}")
             self.vk_api = None
             self.vk_upload = None
     
     def init_database(self):
-        """Инициализация базы данных PostgreSQL"""
-        conn = self.get_db_connection()
+        """Инициализация базы данных"""
+        conn = sqlite3.connect('bot.db')
         cursor = conn.cursor()
         
-        try:
-            # Таблица пользователей с approved статусом
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS users (
-                    id SERIAL PRIMARY KEY,
-                    telegram_id BIGINT UNIQUE NOT NULL,
-                    username TEXT,
-                    first_name TEXT,
-                    is_admin BOOLEAN DEFAULT FALSE,
-                    is_approved BOOLEAN DEFAULT FALSE,
-                    is_active BOOLEAN DEFAULT TRUE,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
-            cursor.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE")
-            cursor.execute("UPDATE users SET is_active = TRUE WHERE is_active IS NULL")
-            
-            # Таблица каналов
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS channels (
-                    id SERIAL PRIMARY KEY,
-                    name TEXT NOT NULL,
-                    telegram_channel TEXT NOT NULL,
-                    vk_group_id TEXT NOT NULL,
-                    created_by INTEGER,
-                    is_active BOOLEAN DEFAULT TRUE,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (created_by) REFERENCES users (id)
-                )
-            ''')
-            
-            # Таблица прав доступа
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS user_permissions (
-                    user_id INTEGER,
-                    channel_id INTEGER,
-                    can_post BOOLEAN DEFAULT TRUE,
-                    PRIMARY KEY (user_id, channel_id),
-                    FOREIGN KEY (user_id) REFERENCES users (id),
-                    FOREIGN KEY (channel_id) REFERENCES channels (id)
-                )
-            ''')
-            
-            # Таблица отложенных постов
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS scheduled_posts (
-                    id SERIAL PRIMARY KEY,
-                    user_id INTEGER REFERENCES users (id),
-                    channel_id INTEGER REFERENCES channels (id),
-                    content TEXT,
-                    status TEXT DEFAULT 'scheduled',
-                    scheduled_at TIMESTAMP WITH TIME ZONE NOT NULL,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    published_at TIMESTAMP WITH TIME ZONE,
-                    error TEXT
-                )
-            ''')
-            
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS scheduled_post_media (
-                    id SERIAL PRIMARY KEY,
-                    post_id INTEGER REFERENCES scheduled_posts (id) ON DELETE CASCADE,
-                    telegram_file_id TEXT NOT NULL,
-                    position INTEGER DEFAULT 0
-                )
-            ''')
-            
-            # Добавляем первого пользователя как администратора
-            cursor.execute(
-                "INSERT INTO users (telegram_id, username, first_name, is_admin, is_approved) VALUES (%s, %s, %s, %s, %s) ON CONFLICT (telegram_id) DO NOTHING",
-                (1258360028, "@sentsuro", "Андрей", True, True)
+        # Таблица пользователей с approved статусом
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_id INTEGER UNIQUE NOT NULL,
+                username TEXT,
+                first_name TEXT,
+                is_admin BOOLEAN DEFAULT FALSE,
+                is_approved BOOLEAN DEFAULT FALSE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
-            
-            conn.commit()
-            logger.info("✅ База данных PostgreSQL инициализирована")
-            
-        except Exception as e:
-            logger.error(f"❌ Ошибка инициализации базы данных: {e}")
-            conn.rollback()
-            raise
-        finally:
-            cursor.close()
-            conn.close()
-    
-    def acquire_leader_lock(self, retry_delay=5):
-        """Гарантируем, что только один экземпляр бота получает обновления"""
-        if self.leader_lock_conn:
-            return
+        ''')
         
-        while True:
-            try:
-                conn = psycopg.connect(DATABASE_URL)
-                conn.autocommit = True
-                cur = conn.cursor()
-                cur.execute("SELECT pg_try_advisory_lock(%s)", (self.leader_lock_id,))
-                got_lock = cur.fetchone()[0]
-                cur.close()
-                
-                if got_lock:
-                    self.leader_lock_conn = conn
-                    atexit.register(self.release_leader_lock)
-                    logger.info(f"✅ Получен лидер-лок {self.leader_lock_id}, стартуем polling")
-                    break
-                
-                conn.close()
-                logger.warning("⏳ Другой экземпляр бота уже запущен. Ждем освобождения блокировки...")
-                time.sleep(retry_delay)
-            
-            except Exception as e:
-                logger.error(f"❌ Ошибка получения лидер-лока: {e}")
-                time.sleep(retry_delay)
-    
-    def release_leader_lock(self):
-        """Освобождаем advisory lock"""
-        if not self.leader_lock_conn:
-            return
+        # Таблица каналов
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS channels (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                telegram_channel TEXT NOT NULL,
+                vk_group_id TEXT NOT NULL,
+                created_by INTEGER,
+                is_active BOOLEAN DEFAULT TRUE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (created_by) REFERENCES users (id)
+            )
+        ''')
         
-        try:
-            cur = self.leader_lock_conn.cursor()
-            cur.execute("SELECT pg_advisory_unlock(%s)", (self.leader_lock_id,))
-            cur.close()
-            self.leader_lock_conn.close()
-            logger.info("🔓 Лидер-лок освобожден")
-        except Exception as e:
-            logger.error(f"❌ Ошибка освобождения лидер-лока: {e}")
-        finally:
-            self.leader_lock_conn = None
-    
-    def execute_query(self, query, params=None):
-        """Универсальный метод выполнения запросов"""
-        conn = self.get_db_connection()
-        cursor = conn.cursor()
+        # Таблица прав доступа
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS user_permissions (
+                user_id INTEGER,
+                channel_id INTEGER,
+                can_post BOOLEAN DEFAULT TRUE,
+                PRIMARY KEY (user_id, channel_id),
+                FOREIGN KEY (user_id) REFERENCES users (id),
+                FOREIGN KEY (channel_id) REFERENCES channels (id)
+            )
+        ''')
         
-        try:
-            if params:
-                cursor.execute(query, params)
-            else:
-                cursor.execute(query)
-            
-            is_select = query.lstrip().upper().startswith('SELECT')
-            has_result = cursor.description is not None
-            
-            if is_select:
-                result = cursor.fetchall()
-            else:
-                result = cursor.fetchall() if has_result else cursor.rowcount
-                conn.commit()
-            
-            return result
-            
-        except Exception as e:
-            logger.error(f"❌ Ошибка выполнения запроса: {e}")
-            conn.rollback()
-            return None
-        finally:
-            cursor.close()
-            conn.close()
+        # Таблица отложенных постов
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS scheduled_posts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                channel_id INTEGER,
+                message_text TEXT,
+                media_data TEXT, -- JSON с информацией о медиа
+                scheduled_time TIMESTAMP NOT NULL,
+                is_published BOOLEAN DEFAULT FALSE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users (id),
+                FOREIGN KEY (channel_id) REFERENCES channels (id)
+            )
+        ''')
+        
+        # Добавляем первого пользователя как администратора
+        cursor.execute(
+            "INSERT OR IGNORE INTO users (telegram_id, username, first_name, is_admin, is_approved) VALUES (?, ?, ?, ?, ?)",
+            (1258360028, "@sentsuro", "Андрей", True, True)
+        )
+        
+        conn.commit()
+        conn.close()
+        logger.info("✅ База данных инициализирована")
     
     def get_user(self, telegram_id):
         """Получаем информацию о пользователе"""
-        query = """
-            SELECT id, username, first_name, is_admin, is_approved
-            FROM users
-            WHERE telegram_id = %s AND is_active = TRUE
-        """
-        result = self.execute_query(query, (telegram_id,))
+        conn = sqlite3.connect('bot.db')
+        cursor = conn.cursor()
         
-        if result and result[0]:
-            user = result[0]
+        cursor.execute(
+            "SELECT id, username, first_name, is_admin, is_approved FROM users WHERE telegram_id = ?",
+            (telegram_id,)
+        )
+        user = cursor.fetchone()
+        
+        conn.close()
+        
+        if user:
             return {
                 'id': user[0],
                 'username': user[1],
                 'first_name': user[2],
-                'is_admin': user[3],
-                'is_approved': user[4]
+                'is_admin': bool(user[3]),
+                'is_approved': bool(user[4])
             }
         return None
     
     def register_user(self, telegram_id, username, first_name):
         """Регистрируем нового пользователя (не approved)"""
-        query = """
-            INSERT INTO users (telegram_id, username, first_name, is_approved, is_active)
-            VALUES (%s, %s, %s, %s, %s)
-            ON CONFLICT (telegram_id) DO UPDATE
-            SET username = EXCLUDED.username,
-                first_name = EXCLUDED.first_name,
-                is_active = TRUE
-        """
-        self.execute_query(query, (telegram_id, username, first_name, False, True))
-        logger.info(f"✅ Зарегистрирован новый пользователь: {username}")
+        conn = sqlite3.connect('bot.db')
+        cursor = conn.cursor()
+        
+        cursor.execute(
+            "INSERT OR IGNORE INTO users (telegram_id, username, first_name, is_approved) VALUES (?, ?, ?, ?)",
+            (telegram_id, username, first_name, False)
+        )
+        
+        conn.commit()
+        conn.close()
     
     def is_user_approved(self, telegram_id):
         """Проверяем approved ли пользователь"""
@@ -310,465 +181,151 @@ class AdminControlledReplyBot:
     
     def get_pending_users(self):
         """Получаем список пользователей ожидающих approval"""
-        query = "SELECT telegram_id, username, first_name FROM users WHERE is_approved = FALSE AND is_active = TRUE"
-        result = self.execute_query(query)
+        conn = sqlite3.connect('bot.db')
+        cursor = conn.cursor()
         
-        if result:
-            return [{
-                'telegram_id': user[0],
-                'username': user[1],
-                'first_name': user[2]
-            } for user in result]
-        return []
+        cursor.execute(
+            "SELECT telegram_id, username, first_name FROM users WHERE is_approved = FALSE"
+        )
+        users = cursor.fetchall()
+        conn.close()
+        
+        return [{
+            'telegram_id': user[0],
+            'username': user[1],
+            'first_name': user[2]
+        } for user in users]
     
     def approve_user(self, telegram_id):
         """Одобряем пользователя и даем доступ ко всем каналам"""
-        # Обновляем статус пользователя
-        self.execute_query(
-            "UPDATE users SET is_approved = TRUE, is_active = TRUE WHERE telegram_id = %s",
+        conn = sqlite3.connect('bot.db')
+        cursor = conn.cursor()
+        
+        cursor.execute(
+            "UPDATE users SET is_approved = TRUE WHERE telegram_id = ?",
             (telegram_id,)
         )
         
         # Получаем ID пользователя
-        user_result = self.execute_query("SELECT id FROM users WHERE telegram_id = %s AND is_active = TRUE", (telegram_id,))
+        cursor.execute("SELECT id FROM users WHERE telegram_id = ?", (telegram_id,))
+        user_result = cursor.fetchone()
         
-        if user_result and user_result[0]:
-            user_id = user_result[0][0]
+        if user_result:
+            user_id = user_result[0]
             
             # Получаем все активные каналы
-            channels_result = self.execute_query("SELECT id FROM channels WHERE is_active = TRUE")
+            cursor.execute("SELECT id FROM channels WHERE is_active = TRUE")
+            channels = cursor.fetchall()
             
             # Даем доступ ко всем каналам
-            for channel in channels_result:
-                self.execute_query(
-                    "INSERT INTO user_permissions (user_id, channel_id, can_post) VALUES (%s, %s, %s) ON CONFLICT (user_id, channel_id) DO UPDATE SET can_post = %s",
-                    (user_id, channel[0], True, True)
+            for channel in channels:
+                cursor.execute(
+                    "INSERT OR REPLACE INTO user_permissions (user_id, channel_id, can_post) VALUES (?, ?, ?)",
+                    (user_id, channel[0], True)
                 )
             
-            logger.info(f"✅ Пользователь {telegram_id} одобрен и получил доступ к {len(channels_result)} каналам")
+            logger.info(f"✅ Пользователь {telegram_id} одобрен и получил доступ к {len(channels)} каналам")
+        
+        conn.commit()
+        conn.close()
+    
+    def delete_user(self, telegram_id):
+        """Удаляем пользователя"""
+        conn = sqlite3.connect('bot.db')
+        cursor = conn.cursor()
+        
+        # Получаем ID пользователя
+        cursor.execute("SELECT id FROM users WHERE telegram_id = ?", (telegram_id,))
+        user_result = cursor.fetchone()
+        
+        if user_result:
+            user_id = user_result[0]
+            
+            # Удаляем права доступа
+            cursor.execute("DELETE FROM user_permissions WHERE user_id = ?", (user_id,))
+            
+            # Удаляем пользователя
+            cursor.execute("DELETE FROM users WHERE id = ?", (user_id,))
+            
+            logger.info(f"✅ Пользователь {telegram_id} удален")
+        
+        conn.commit()
+        conn.close()
     
     def grant_access_to_all_users(self, channel_id):
         """Выдать доступ к новому каналу всем одобренным пользователям"""
-        users_result = self.execute_query("SELECT id FROM users WHERE is_approved = TRUE AND is_active = TRUE")
+        conn = sqlite3.connect('bot.db')
+        cursor = conn.cursor()
         
-        if users_result:
-            for user in users_result:
-                self.execute_query(
-                    "INSERT INTO user_permissions (user_id, channel_id, can_post) VALUES (%s, %s, %s) ON CONFLICT (user_id, channel_id) DO UPDATE SET can_post = %s",
-                    (user[0], channel_id, True, True)
-                )
-            
-            logger.info(f"✅ Все одобренные пользователи получили доступ к каналу {channel_id}")
+        # Получаем всех одобренных пользователей
+        cursor.execute("SELECT id FROM users WHERE is_approved = TRUE")
+        users = cursor.fetchall()
+        
+        # Даем каждому пользователю доступ к новому каналу
+        for user in users:
+            cursor.execute(
+                "INSERT OR REPLACE INTO user_permissions (user_id, channel_id, can_post) VALUES (?, ?, ?)",
+                (user[0], channel_id, True)
+            )
+        
+        conn.commit()
+        conn.close()
+        logger.info(f"✅ Все одобренные пользователи получили доступ к каналу {channel_id}")
     
     def get_user_channels(self, user_id):
         """Получаем каналы доступные пользователю"""
-        # Сначала проверяем, approved ли пользователь
-        user_result = self.execute_query("SELECT is_approved, is_admin FROM users WHERE id = %s AND is_active = TRUE", (user_id,))
+        conn = sqlite3.connect('bot.db')
+        cursor = conn.cursor()
         
-        if not user_result or not user_result[0]:
-            return []
+        cursor.execute('''
+            SELECT c.id, c.name, c.telegram_channel, c.vk_group_id 
+            FROM channels c
+            LEFT JOIN user_permissions up ON c.id = up.channel_id AND up.user_id = ?
+            WHERE c.is_active = TRUE AND (up.can_post = TRUE OR c.created_by = ? OR 
+                  (SELECT is_admin FROM users WHERE id = ?) = TRUE)
+        ''', (user_id, user_id, user_id))
         
-        is_approved = user_result[0][0]
-        is_admin = user_result[0][1]
+        channels = cursor.fetchall()
+        conn.close()
         
-        # Если пользователь не approved и не админ - возвращаем пустой список
-        if not is_approved and not is_admin:
-            return []
-        
-        # Для approved пользователей и админов возвращаем ВСЕ активные каналы
-        query = "SELECT id, name, telegram_channel, vk_group_id FROM channels WHERE is_active = TRUE ORDER BY name"
-        result = self.execute_query(query)
-        
-        if result:
-            return [{
-                'id': channel[0],
-                'name': channel[1],
-                'telegram': channel[2],
-                'vk_group_id': channel[3]
-            } for channel in result]
-        return []
+        return [{
+            'id': channel[0],
+            'name': channel[1],
+            'telegram': channel[2],
+            'vk_group_id': channel[3]
+        } for channel in channels]
     
     def get_all_channels(self):
         """Получаем все каналы (для админов)"""
-        query = "SELECT id, name, telegram_channel, vk_group_id FROM channels WHERE is_active = TRUE ORDER BY name"
-        result = self.execute_query(query)
+        conn = sqlite3.connect('bot.db')
+        cursor = conn.cursor()
         
-        if result:
-            return [{
-                'id': channel[0],
-                'name': channel[1],
-                'telegram': channel[2],
-                'vk_group_id': channel[3]
-            } for channel in result]
-        return []
-    
-    def get_channel_by_id(self, channel_id: int) -> Optional[dict]:
-        """Получаем данные канала по ID"""
-        result = self.execute_query(
-            "SELECT id, name, telegram_channel, vk_group_id FROM channels WHERE id = %s AND is_active = TRUE",
-            (channel_id,)
-        )
-        if result:
-            data = result[0]
-            return {
-                'id': data[0],
-                'name': data[1],
-                'telegram': data[2],
-                'vk_group_id': data[3]
-            }
-        return None
-    
-    # --- Работа с черновиками постов ---
-    
-    def get_post_draft(self, context: ContextTypes.DEFAULT_TYPE) -> Optional[dict]:
-        return context.user_data.get('post_draft')
-    
-    def reset_post_draft(self, context: ContextTypes.DEFAULT_TYPE):
-        context.user_data.pop('post_draft', None)
-        context.user_data.pop('schedule_stage', None)
-    
-    def ensure_post_draft(self, context: ContextTypes.DEFAULT_TYPE, channel: dict, user_id: int):
-        context.user_data['post_draft'] = {
-            'channel': channel,
-            'user_id': user_id,
-            'text_parts': [],
-            'photos': [],
-            'created_at': datetime.now(tz=self.timezone)
-        }
-    
-    def append_text_to_draft(self, context: ContextTypes.DEFAULT_TYPE, text: str):
-        draft = self.get_post_draft(context)
-        if not draft:
-            return
-        draft['text_parts'].append(text.strip())
-    
-    def add_photo_to_draft(self, context: ContextTypes.DEFAULT_TYPE, file_id: str):
-        draft = self.get_post_draft(context)
-        if not draft:
-            return
-        draft['photos'].append({'file_id': file_id, 'added_at': datetime.now(tz=self.timezone)})
-    
-    def get_draft_text(self, draft: dict) -> str:
-        return "\n\n".join(part for part in draft.get('text_parts', []) if part).strip()
-    
-    def get_draft_photo_ids(self, draft: dict) -> List[str]:
-        return [photo['file_id'] for photo in draft.get('photos', [])]
-    
-    def get_post_actions_keyboard(self):
-        return ReplyKeyboardMarkup(
-            [
-                ["✅ Опубликовать сейчас"],
-                ["🕒 Отложить пост", "🗑️ Очистить пост"],
-                ["🔙 Назад в меню"]
-            ],
-            resize_keyboard=True
-        )
-    
-    async def add_text_to_draft_flow(self, update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
-        draft = self.get_post_draft(context)
-        if not draft:
-            await update.message.reply_text("❌ Сначала выберите канал через меню.")
-            return
+        cursor.execute("SELECT id, name, telegram_channel, vk_group_id FROM channels WHERE is_active = TRUE")
+        channels = cursor.fetchall()
         
-        cleaned = text.strip()
-        if not cleaned:
-            await update.message.reply_text("⚠️ Пустой текст не сохранен.")
-            return
+        conn.close()
         
-        self.append_text_to_draft(context, cleaned)
-        total_length = len(self.get_draft_text(draft))
-        await update.message.reply_text(
-            f"✍️ Текст добавлен (всего {total_length} символов).\n"
-            f"Добавьте фото или выберите действие ниже.",
-            reply_markup=self.get_post_actions_keyboard()
-        )
+        return [{
+            'id': channel[0],
+            'name': channel[1],
+            'telegram': channel[2],
+            'vk_group_id': channel[3]
+        } for channel in channels]
     
-    async def publish_draft_now(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        draft = self.get_post_draft(context)
-        if not draft:
-            await update.message.reply_text("❌ Черновик не найден. Выберите канал заново.")
-            return
+    def delete_channel(self, channel_id):
+        """Удаляем канал"""
+        conn = sqlite3.connect('bot.db')
+        cursor = conn.cursor()
         
-        text_content = self.get_draft_text(draft)
-        photo_ids = self.get_draft_photo_ids(draft)
+        # Удаляем права доступа
+        cursor.execute("DELETE FROM user_permissions WHERE channel_id = ?", (channel_id,))
         
-        if not text_content and not photo_ids:
-            await update.message.reply_text("⚠️ Добавьте текст или фото перед публикацией.")
-            return
+        # Удаляем канал (мягкое удаление)
+        cursor.execute("UPDATE channels SET is_active = FALSE WHERE id = ?", (channel_id,))
         
-        try:
-            result = await self.publish_content(context.bot, draft['channel'], text_content, photo_ids)
-            self.reset_post_draft(context)
-            
-            await update.message.reply_text(
-                f"✅ Пост опубликован в {draft['channel']['name']}.\n{result['vk_status']}",
-                reply_markup=ReplyKeyboardMarkup([["📢 Опубликовать пост"], ["🔙 Назад в меню"]], resize_keyboard=True)
-            )
-        except Exception as e:
-            logger.error(f"Ошибка публикации поста: {e}")
-            await update.message.reply_text(f"❌ Ошибка публикации: {e}")
-    
-    async def clear_post_draft(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not self.get_post_draft(context):
-            await update.message.reply_text("ℹ️ Черновик уже пуст.")
-            return
-        self.reset_post_draft(context)
-        await update.message.reply_text(
-            "🗑️ Черновик очищен. Выберите канал заново через меню.",
-            reply_markup=ReplyKeyboardMarkup([["📢 Опубликовать пост"], ["🔙 Назад в меню"]], resize_keyboard=True)
-        )
-    
-    async def download_file_bytes(self, bot, file_id: str) -> Optional[bytes]:
-        try:
-            tg_file = await bot.get_file(file_id)
-            return await tg_file.download_as_bytearray()
-        except Exception as e:
-            logger.error(f"❌ Не удалось скачать файл {file_id}: {e}")
-            return None
-    
-    async def publish_to_telegram(self, bot, channel: dict, text: str, photo_ids: List[str]):
-        chat_id = channel['telegram']
-        sent_messages = []
-        
-        if photo_ids:
-            caption = text if text and len(text) <= 1024 else None
-            remaining_text = text if caption is None else ""
-            
-            media_group = []
-            for idx, file_id in enumerate(photo_ids):
-                media_group.append(
-                    InputMediaPhoto(
-                        media=file_id,
-                        caption=caption if idx == 0 and caption else None
-                    )
-                )
-            
-            sent_messages = await bot.send_media_group(chat_id=chat_id, media=media_group)
-            
-            if remaining_text:
-                extra_message = await bot.send_message(chat_id=chat_id, text=remaining_text)
-                sent_messages.append(extra_message)
-        else:
-            if not text:
-                raise ValueError("Пустой пост запрещен")
-            sent_messages.append(await bot.send_message(chat_id=chat_id, text=text))
-        
-        return [message.message_id for message in sent_messages]
-    
-    async def publish_to_vk(self, bot, channel: dict, text: str, photo_ids: List[str]) -> str:
-        if not self.check_vk_token():
-            return "⚠️ VK недоступен (нет токена)"
-        
-        attachments = []
-        
-        if photo_ids:
-            for file_id in photo_ids:
-                photo_bytes = await self.download_file_bytes(bot, file_id)
-                if not photo_bytes:
-                    continue
-                upload_result = self.vk_upload.photo_wall(
-                    photos=BytesIO(photo_bytes),
-                    group_id=channel['vk_group_id'].lstrip('-')
-                )
-                if upload_result:
-                    info = upload_result[0]
-                    attachments.append(f"photo{info['owner_id']}_{info['id']}")
-        
-        try:
-            self.vk_api.wall.post(
-                owner_id=channel['vk_group_id'],
-                message=text or "",
-                attachments=",".join(attachments) if attachments else None
-            )
-            return "✅ Опубликовано в VK"
-        except Exception as e:
-            logger.error(f"Ошибка публикации в VK: {e}")
-            return f"❌ Ошибка VK: {e}"
-    
-    async def publish_content(self, bot, channel: dict, text: str, photo_ids: List[str]) -> dict:
-        telegram_message_ids = await self.publish_to_telegram(bot, channel, text, photo_ids)
-        vk_status = await self.publish_to_vk(bot, channel, text, photo_ids)
-        return {
-            'telegram_message_ids': telegram_message_ids,
-            'vk_status': vk_status
-        }
-    
-    def save_scheduled_post(self, user_id: int, channel_id: int, text: str, photo_ids: List[str], when_utc: datetime) -> Optional[int]:
-        result = self.execute_query(
-            '''
-            INSERT INTO scheduled_posts (user_id, channel_id, content, scheduled_at, status)
-            VALUES (%s, %s, %s, %s, %s)
-            RETURNING id
-            ''',
-            (user_id, channel_id, text, when_utc, 'scheduled')
-        )
-        if not result:
-            return None
-        post_id = result[0][0]
-        for position, file_id in enumerate(photo_ids):
-            self.execute_query(
-                '''
-                INSERT INTO scheduled_post_media (post_id, telegram_file_id, position)
-                VALUES (%s, %s, %s)
-                ''',
-                (post_id, file_id, position)
-            )
-        return post_id
-    
-    def parse_schedule_datetime(self, text: str) -> Optional[datetime]:
-        formats = [
-            "%d.%m.%Y %H:%M",
-            "%d.%m %H:%M",
-            "%H:%M %d.%m.%Y"
-        ]
-        cleaned = text.strip()
-        for fmt in formats:
-            try:
-                dt = datetime.strptime(cleaned, fmt)
-                if "%Y" not in fmt:
-                    dt = dt.replace(year=datetime.now(tz=self.timezone).year)
-                localized = dt.replace(tzinfo=self.timezone)
-                return localized.astimezone(timezone.utc)
-            except ValueError:
-                continue
-        return None
-    
-    async def start_schedule_flow(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        draft = self.get_post_draft(context)
-        if not draft:
-            await update.message.reply_text("❌ Сначала выберите канал и подготовьте пост.")
-            return
-        
-        context.user_data['schedule_stage'] = 'awaiting_datetime'
-        await update.message.reply_text(
-            "🕒 Введите дату и время публикации в формате `ДД.ММ.ГГГГ ЧЧ:ММ`.\n"
-            "Можно указать без года: `ДД.ММ ЧЧ:ММ`.\n\n"
-            "Пример: `25.11 14:30`",
-            reply_markup=ReplyKeyboardMarkup([["❌ Отменить планирование"]], resize_keyboard=True),
-            parse_mode='Markdown'
-        )
-    
-    async def cancel_schedule_flow(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        context.user_data.pop('schedule_stage', None)
-        await update.message.reply_text(
-            "⛔️ Планирование отменено. Пост остался в черновике.",
-            reply_markup=self.get_post_actions_keyboard()
-        )
-    
-    async def handle_schedule_datetime(self, update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
-        draft = self.get_post_draft(context)
-        if not draft:
-            await update.message.reply_text("❌ Черновик не найден. Начните заново через '📢 Опубликовать пост'.")
-            context.user_data.pop('schedule_stage', None)
-            return
-        
-        schedule_dt = self.parse_schedule_datetime(text)
-        if not schedule_dt:
-            await update.message.reply_text("❌ Не удалось разобрать дату. Используйте формат `ДД.ММ.ГГГГ ЧЧ:ММ`.")
-            return
-        
-        now = datetime.now(timezone.utc)
-        if schedule_dt <= now + timedelta(minutes=1):
-            await update.message.reply_text("⚠️ Время должно быть минимум на 1 минуту в будущем.")
-            return
-        
-        text_content = self.get_draft_text(draft)
-        photo_ids = self.get_draft_photo_ids(draft)
-        
-        if not text_content and not photo_ids:
-            await update.message.reply_text("❌ Пустой пост нельзя запланировать. Добавьте текст или фото.")
-            return
-        
-        post_id = self.save_scheduled_post(
-            user_id=draft['user_id'],
-            channel_id=draft['channel']['id'],
-            text=text_content,
-            photo_ids=photo_ids,
-            when_utc=schedule_dt
-        )
-        
-        if not post_id:
-            await update.message.reply_text("❌ Не удалось сохранить отложенный пост. Попробуйте позже.")
-            return
-        
-        self.reset_post_draft(context)
-        
-        schedule_local = schedule_dt.astimezone(self.timezone).strftime('%d.%m.%Y %H:%M')
-        await update.message.reply_text(
-            f"🗓 Пост запланирован на {schedule_local} ({BOT_TIMEZONE}).\nID задачи: {post_id}",
-            reply_markup=ReplyKeyboardMarkup([["🔙 Назад в меню"]], resize_keyboard=True)
-        )
-    
-    def start_scheduler(self):
-        """Запускаем фоновый обработчик отложенных постов"""
-        if not self.tg_app.job_queue:
-            logger.warning("⚠️ Job queue недоступен, планировщик не запущен")
-            return
-        
-        if self.scheduler_job:
-            self.scheduler_job.schedule_removal()
-        
-        self.scheduler_job = self.tg_app.job_queue.run_repeating(
-            self.process_scheduled_posts,
-            interval=SCHEDULE_POLL_INTERVAL,
-            first=10
-        )
-        logger.info(f"🗓 Планировщик отложенных постов включен (каждые {SCHEDULE_POLL_INTERVAL} сек)")
-    
-    async def process_scheduled_posts(self, context: ContextTypes.DEFAULT_TYPE):
-        """Проверяем очередь и публикуем готовые посты"""
-        due_posts = self.execute_query(
-            '''
-            SELECT sp.id, sp.channel_id, sp.content
-            FROM scheduled_posts sp
-            JOIN channels c ON c.id = sp.channel_id
-            WHERE sp.status = 'scheduled'
-              AND sp.scheduled_at <= NOW()
-              AND c.is_active = TRUE
-            ORDER BY sp.scheduled_at
-            LIMIT 5
-            '''
-        )
-        
-        if not due_posts:
-            return
-        
-        for post in due_posts:
-            post_id, channel_id, content = post
-            updated = self.execute_query(
-                "UPDATE scheduled_posts SET status = 'processing' WHERE id = %s AND status = 'scheduled'",
-                (post_id,)
-            )
-            if updated == 0:
-                continue
-            
-            channel = self.get_channel_by_id(channel_id)
-            if not channel:
-                self.execute_query(
-                    "UPDATE scheduled_posts SET status = 'cancelled', error = %s WHERE id = %s",
-                    ("Канал недоступен", post_id)
-                )
-                continue
-            
-            media_rows = self.execute_query(
-                "SELECT telegram_file_id FROM scheduled_post_media WHERE post_id = %s ORDER BY position",
-                (post_id,)
-            )
-            photo_ids = [row[0] for row in media_rows] if media_rows else []
-            
-            try:
-                await self.publish_content(context.bot, channel, content or "", photo_ids)
-                self.execute_query(
-                    "UPDATE scheduled_posts SET status = 'published', published_at = NOW(), error = NULL WHERE id = %s",
-                    (post_id,)
-                )
-                logger.info(f"✅ Отложенный пост {post_id} опубликован")
-            except Exception as e:
-                self.execute_query(
-                    "UPDATE scheduled_posts SET status = 'failed', error = %s WHERE id = %s",
-                    (str(e), post_id)
-                )
-                logger.error(f"❌ Ошибка публикации отложенного поста {post_id}: {e}")
+        conn.commit()
+        conn.close()
+        logger.info(f"✅ Канал {channel_id} удален")
     
     def check_vk_token(self):
         """Проверка валидности VK токена"""
@@ -785,19 +342,34 @@ class AdminControlledReplyBot:
     
     def get_vk_token_message(self):
         """Сообщение с инструкцией по получению нового токена"""
+        is_render = os.getenv('RENDER')
+        platform_info = "🚀 **Render.com**" if is_render else "💻 **Локальный сервер**"
+        
         token_message = (
-            "🔑 **VK токен истек или невалиден!**\n\n"
+            f"🔑 **VK токен истек или невалиден!**\n\n"
+            f"Платформа: {platform_info}\n\n"
             "Чтобы получить новый токен:\n\n"
             "1. **Перейди по ссылке:**\n"
             "https://oauth.vk.com/authorize?client_id=6121396&scope=photos,groups,wall,offline&redirect_uri=https://oauth.vk.com/blank.html&display=page&v=5.199&response_type=token\n\n"
             "2. **Скопируй токен из адресной строки** (часть между `access_token=` и `&expires_in`)\n\n"
-            "3. **Обнови токен командой:**\n"
-            "`/update_token ваш_новый_токен`\n\n"
-            "**Или просто отправь ссылку из адресной строки** - бот автоматически извлечет токен!\n\n"
-            "⚠️ **На Render.com токен обновляется только в памяти бота!**\n"
-            "После перезапуска сервиса нужно будет обновить токен снова.\n\n"
-            "Для постоянного хранения токена обновите переменную окружения в Dashboard Render."
         )
+        
+        if is_render:
+            token_message += (
+                "3. **Обнови токен командой:**\n"
+                "`/update_token ваш_новый_токен`\n\n"
+                "**Или просто отправь ссылку из адресной строки** - бот автоматически извлечет токен!\n\n"
+                "⚠️ **На Render.com токен обновляется только в памяти бота!**\n"
+                "После перезапуска сервиса нужно будет обновить токен снова.\n\n"
+                "Для постоянного хранения токена обновите переменную окружения в Dashboard Render."
+            )
+        else:
+            token_message += (
+                "3. **Обнови токен командой:**\n"
+                "`/update_token ваш_новый_токен`\n\n"
+                "**Или просто отправь ссылку из адресной строки** - бот автоматически извлечет токен!\n\n"
+                "Токен будет сохранен в файле .env"
+            )
         
         token_message += "\n\n📎 **Ссылка для копирования:**\n"
         token_message += "`https://oauth.vk.com/authorize?client_id=6121396&scope=photos,groups,wall,offline&redirect_uri=https://oauth.vk.com/blank.html&display=page&v=5.199&response_type=token`"
@@ -833,7 +405,7 @@ class AdminControlledReplyBot:
         return None
     
     def update_vk_token(self, new_token: str) -> bool:
-        """Обновляет VK токен в памяти"""
+        """Обновляет VK токен в памяти и в файле .env (только если не на Render)"""
         try:
             # Обновляем глобальную переменную
             global VK_TOKEN
@@ -842,12 +414,50 @@ class AdminControlledReplyBot:
             # Переинициализируем VK API
             self.init_vk_api()
             
-            logger.info("✅ VK токен обновлен в памяти (Render.com)")
+            # Обновляем в файле .env только если не на Render
+            if not os.getenv('RENDER'):
+                self.update_env_file(new_token)
+                logger.info("✅ VK токен обновлен в памяти и в .env файле")
+            else:
+                logger.info("✅ VK токен обновлен в памяти (Render.com)")
+            
             return True
             
         except Exception as e:
             logger.error(f"❌ Ошибка обновления токена: {e}")
             return False
+    
+    def update_env_file(self, new_token: str):
+        """Обновляет токен в файле .env (только для локального использования)"""
+        try:
+            # Читаем текущий файл
+            with open('.env', 'r', encoding='utf-8') as file:
+                lines = file.readlines()
+            
+            # Обновляем или добавляем VK_TOKEN
+            token_updated = False
+            new_lines = []
+            
+            for line in lines:
+                if line.startswith('VK_TOKEN='):
+                    new_lines.append(f'VK_TOKEN={new_token}\n')
+                    token_updated = True
+                else:
+                    new_lines.append(line)
+            
+            # Если токен не был найден, добавляем новую строку
+            if not token_updated:
+                new_lines.append(f'VK_TOKEN={new_token}\n')
+            
+            # Записываем обратно
+            with open('.env', 'w', encoding='utf-8') as file:
+                file.writelines(new_lines)
+                
+            logger.info("✅ Файл .env обновлен")
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка обновления .env файла: {e}")
+            raise
     
     async def update_token_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Команда для обновления VK токена через ссылку"""
@@ -860,18 +470,25 @@ class AdminControlledReplyBot:
         
         # Проверяем, есть ли ссылка в сообщении
         if not context.args:
+            is_render = os.getenv('RENDER')
+            platform_info = "Render.com" if is_render else "локальном сервере"
+            
             message = (
-                "🔧 **Обновление VK токена**\n\n"
-                "Платформа: Render.com\n\n"
+                f"🔧 **Обновление VK токена**\n\n"
+                f"Платформа: {platform_info}\n\n"
                 "Отправьте команду в формате:\n"
                 "`/update_token https://oauth.vk.com/blank.html#access_token=ваш_токен&expires_in=...`\n\n"
                 "Или просто отправьте новый токен:\n"
                 "`/update_token ваш_новый_токен`\n\n"
                 "Также можно просто отправить ссылку в чат - бот автоматически распознает токен!\n\n"
-                "⚠️ **Внимание:** На Render.com токен обновляется только в памяти бота.\n"
-                "После перезапуска сервиса потребуется обновить токен снова.\n\n"
-                "Для постоянного хранения обновите переменную окружения в Dashboard Render."
             )
+            
+            if is_render:
+                message += (
+                    "⚠️ **Внимание:** На Render.com токен обновляется только в памяти бота.\n"
+                    "После перезапуска сервиса потребуется обновить токен снова.\n\n"
+                    "Для постоянного хранения обновите переменную окружения в Dashboard Render."
+                )
             
             await update.message.reply_text(message)
             return
@@ -891,16 +508,25 @@ class AdminControlledReplyBot:
         
         # Обновляем токен
         if self.update_vk_token(new_token):
+            is_render = os.getenv('RENDER')
+            
             message = (
                 f"✅ VK токен успешно обновлен!\n\n"
                 f"Токен: `{new_token[:15]}...{new_token[-10:]}`\n"
                 f"Длина токена: {len(new_token)} символов\n\n"
                 f"Статус VK: {'✅ Работает' if self.check_vk_token() else '❌ Ошибка'}\n\n"
-                "⚠️ **Токен обновлен только в памяти бота**\n"
-                "После перезапуска сервиса на Render.com потребуется обновить токен снова.\n\n"
-                "Для постоянного хранения обновите переменную `VK_TOKEN` в Dashboard Render.\n\n"
-                "Проверьте статус: /status"
             )
+            
+            if is_render:
+                message += (
+                    "⚠️ **Токен обновлен только в памяти бота**\n"
+                    "После перезапуска сервиса на Render.com потребуется обновить токен снова.\n\n"
+                    "Для постоянного хранения обновите переменную `VK_TOKEN` в Dashboard Render.\n\n"
+                )
+            else:
+                message += "✅ Токен сохранен в файл .env\n\n"
+            
+            message += "Проверьте статус: /status"
             
             await update.message.reply_text(message)
         else:
@@ -922,15 +548,24 @@ class AdminControlledReplyBot:
             
             if new_token:
                 if self.update_vk_token(new_token):
+                    is_render = os.getenv('RENDER')
+                    
                     message = (
                         f"✅ VK токен автоматически обновлен!\n\n"
                         f"Токен: `{new_token[:15]}...{new_token[-10:]}`\n"
                         f"Длина токена: {len(new_token)} символов\n\n"
                         f"Статус VK: {'✅ Работает' if self.check_vk_token() else '❌ Ошибка'}\n\n"
-                        "⚠️ **Токен обновлен только в памяти бота**\n"
-                        "После перезапуска сервиса потребуется обновить токен снова.\n\n"
-                        "Проверьте статус: /status"
                     )
+                    
+                    if is_render:
+                        message += (
+                            "⚠️ **Токен обновлен только в памяти бота**\n"
+                            "После перезапуска сервиса потребуется обновить токен снова.\n\n"
+                        )
+                    else:
+                        message += "✅ Токен сохранен в файл .env\n\n"
+                    
+                    message += "Проверьте статус: /status"
                     
                     await update.message.reply_text(message)
                 else:
@@ -951,7 +586,7 @@ class AdminControlledReplyBot:
         self.register_user(user.id, user.username, user.first_name)
         user_info = self.get_user(user.id)
         
-        if not user_info or not user_info['is_approved']:
+        if not user_info['is_approved']:
             await update.message.reply_text(
                 "⏳ Ваш аккаунт ожидает одобрения администратором.\n\n"
                 "Как только администратор одобрит ваш доступ, вы сможете пользоваться ботом.\n\n"
@@ -974,17 +609,17 @@ class AdminControlledReplyBot:
         if user_info['is_admin']:
             # Меню для администратора
             keyboard = [
-                ["📢 Опубликовать пост", "📋 Мои каналы"],
-                ["🆕 Новые каналы", "👥 Управление пользователями"],
+                ["📢 Опубликовать пост", "⏰ Отложенный пост"],
+                ["📋 Мои каналы", "👥 Управление пользователями"],
                 ["⚙️ Управление каналами", "👑 Управление админами"],
-                ["ℹ️ Помощь", "❌ Скрыть меню"],
-                ["🛑 Остановить бота"]
+                ["📊 Статус", "ℹ️ Помощь"],
+                ["🛑 Остановить бота", "❌ Скрыть меню"]
             ]
         else:
             # Меню для обычного пользователя
             keyboard = [
-                ["📢 Опубликовать пост", "📋 Мои каналы"],
-                ["🆕 Новые каналы", "ℹ️ Помощь"],
+                ["📢 Опубликовать пост", "⏰ Отложенный пост"],
+                ["📋 Мои каналы", "ℹ️ Помощь"],
                 ["❌ Скрыть меню"]
             ]
         
@@ -996,10 +631,12 @@ class AdminControlledReplyBot:
         
         role_text = "👑 Администратор" if user_info['is_admin'] else "👤 Пользователь"
         vk_status = "✅" if self.check_vk_token() else "❌"
+        is_render = os.getenv('RENDER')
+        platform_info = "🚀 Render.com" if is_render else "💻 Локальный"
         
         message = (
             f"🎯 **Главное меню**\n\n"
-            f"Платформа: 🚀 Render.com\n"
+            f"Платформа: {platform_info}\n"
             f"Роль: {role_text}\n"
             f"Имя: {user_info['first_name']}\n"
             f"VK: {vk_status}\n\n"
@@ -1033,11 +670,11 @@ class AdminControlledReplyBot:
         if text == "📢 Опубликовать пост":
             await self.show_publish_menu(update, context)
         
+        elif text == "⏰ Отложенный пост":
+            await self.show_schedule_menu(update, context)
+        
         elif text == "📋 Мои каналы":
             await self.show_my_channels(update, context)
-        
-        elif text == "🆕 Новые каналы":
-            await self.show_new_channels(update, context)
         
         elif text == "👥 Управление пользователями" and user_info['is_admin']:
             await self.show_user_management(update, context)
@@ -1045,49 +682,23 @@ class AdminControlledReplyBot:
         elif text == "⚙️ Управление каналами" and user_info['is_admin']:
             await self.show_channel_management(update, context)
         
-        elif text == "🔄 Синхронизировать доступ" and user_info['is_admin']:
-            await self.sync_user_access(update, context)
-        
-        elif text == "🗑️ Удалить канал" and user_info['is_admin']:
-            await self.start_delete_channel(update, context)
-        
         elif text == "👑 Управление админами" and user_info['is_admin']:
             await self.admin_management(update, context)
         
-        elif text == "👥 Список админов" and user_info['is_admin']:
-            await self.show_admins_list(update, context)
-        
-        elif text == "➕ Добавить админа" and user_info['is_admin']:
-            await self.start_add_admin(update, context)
-        
-        elif text == "🗑️ Удалить пользователя" and user_info['is_admin']:
-            await self.start_delete_user(update, context)
-        
-        elif text == "🛑 Остановить бота" and user_info['is_admin']:
-            await self.request_shutdown(update, context)
+        elif text == "📊 Статус":
+            await self.status_command(update, context)
         
         elif text == "ℹ️ Помощь":
             await self.show_help(update, context)
+        
+        elif text == "🛑 Остановить бота" and user_info['is_admin']:
+            await self.stop_bot(update, context)
         
         elif text == "❌ Скрыть меню":
             await self.hide_keyboard(update, context)
         
         elif text == "🔙 Назад в меню":
-            self.reset_post_draft(context)
-            context.user_data.pop('channel_delete_stage', None)
-            context.user_data.pop('user_delete_stage', None)
             await self.show_main_menu(update, context)
-        
-        elif text == "❌ Отменить добавление":
-            await self.cancel_setup(update, context)
-        
-        elif text == "❌ Отменить удаление канала" and context.user_data.get('channel_delete_stage'):
-            context.user_data.pop('channel_delete_stage', None)
-            await self.show_channel_management(update, context)
-        
-        elif text == "❌ Отменить удаление пользователя" and context.user_data.get('user_delete_stage'):
-            context.user_data.pop('user_delete_stage', None)
-            await self.show_user_management(update, context)
         
         elif text == "✅ Одобрить всех пользователей" and user_info['is_admin']:
             await self.approve_all_users(update, context)
@@ -1095,59 +706,76 @@ class AdminControlledReplyBot:
         elif text == "➕ Добавить канал" and user_info['is_admin']:
             await self.start_add_channel(update, context)
         
-        elif text == "✅ Опубликовать сейчас":
-            await self.publish_draft_now(update, context)
+        elif text == "🗑️ Удалить канал" and user_info['is_admin']:
+            await self.start_delete_channel(update, context)
         
-        elif text == "🕒 Отложить пост":
-            await self.start_schedule_flow(update, context)
-        
-        elif text == "🗑️ Очистить пост":
-            await self.clear_post_draft(update, context)
-        
-        elif text == "❌ Отменить планирование" and context.user_data.get('schedule_stage') == 'awaiting_datetime':
-            await self.cancel_schedule_flow(update, context)
-        
-        elif text == "✅ Подтвердить остановку" and context.user_data.get('shutdown_stage') == 'confirm_shutdown':
-            await self.confirm_shutdown(update, context)
-        
-        elif text == "❌ Отмена остановки" and context.user_data.get('shutdown_stage'):
-            context.user_data.pop('shutdown_stage', None)
-            await update.message.reply_text("Остановка отменена.", reply_markup=ReplyKeyboardRemove())
-            await self.show_main_menu(update, context)
-        
-        # Обработка подтверждения добавления администратора
-        elif text == "✅ Да, сделать администратором" and context.user_data.get('setup_stage') == 'confirm_admin_addition':
-            await self.complete_admin_addition(update, context)
-        
-        # Обработка процесса добавления администратора
-        elif context.user_data.get('setup_stage', '').startswith('awaiting_admin'):
-            await self.handle_admin_setup(update, context, text)
-        
-        elif context.user_data.get('schedule_stage') == 'awaiting_datetime':
-            await self.handle_schedule_datetime(update, context, text)
+        elif text == "🗑️ Удалить пользователя" and user_info['is_admin']:
+            await self.start_delete_user(update, context)
         
         # Если это выбор канала для публикации
         elif text.startswith("📢 "):
             channel_name = text[2:]  # Убираем эмодзи
             await self.select_channel_for_publishing(update, context, channel_name)
         
+        # Если это выбор канала для отложенного поста
+        elif text.startswith("⏰ "):
+            channel_name = text[2:]  # Убираем эмодзи
+            await self.select_channel_for_scheduling(update, context, channel_name)
+        
         # Обработка процесса добавления канала
-        elif context.user_data.get('setup_stage') in {'awaiting_name', 'awaiting_telegram', 'awaiting_vk'}:
+        elif 'setup_stage' in context.user_data:
             await self.handle_channel_setup(update, context, text)
         
-        elif context.user_data.get('channel_delete_stage') == 'awaiting_channel':
-            await self.handle_channel_delete(update, context, text)
+        # Обработка процесса удаления канала
+        elif 'delete_channel_stage' in context.user_data:
+            await self.handle_channel_deletion(update, context, text)
         
-        elif context.user_data.get('user_delete_stage') == 'awaiting_user':
-            await self.handle_user_delete(update, context, text)
+        # Обработка процесса удаления пользователя
+        elif 'delete_user_stage' in context.user_data:
+            await self.handle_user_deletion(update, context, text)
         
-        elif self.get_post_draft(context):
-            await self.add_text_to_draft_flow(update, context, text)
+        # Обработка процесса добавления администратора
+        elif 'add_admin_stage' in context.user_data:
+            await self.handle_admin_addition(update, context, text)
+        
+        # Обработка процесса планирования поста
+        elif 'schedule_stage' in context.user_data:
+            await self.handle_schedule_setup(update, context, text)
+        
+        # Если это обычный текст и выбран канал - публикуем
+        elif 'selected_channel' in context.user_data:
+            await self.publish_text(update, context, text)
         
         else:
             await update.message.reply_text(
                 "ℹ️ Используйте меню для навигации или /menu для показа меню"
             )
+    
+    async def handle_other_messages(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработка других типов сообщений"""
+        user = update.effective_user
+        
+        if not self.is_user_approved(user.id):
+            await update.message.reply_text("❌ Доступ запрещен. Ожидайте одобрения администратора.")
+            return
+        
+        # Если есть медиа группа (несколько фото)
+        if update.message.media_group_id:
+            if 'media_group' not in context.user_data:
+                context.user_data['media_group'] = {
+                    'id': update.message.media_group_id,
+                    'messages': []
+                }
+            
+            context.user_data['media_group']['messages'].append(update.message)
+            
+            # Если это первое сообщение в группе, сообщаем пользователю
+            if len(context.user_data['media_group']['messages']) == 1:
+                await update.message.reply_text("📸 Получена группа медиа. Отправьте все фото, затем текст для публикации.")
+        
+        # Если выбран канал и это не медиа группа
+        elif 'selected_channel' in context.user_data and not update.message.media_group_id:
+            await update.message.reply_text("❌ Для публикации используйте текст или фото.")
     
     async def show_publish_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Меню публикации"""
@@ -1179,11 +807,45 @@ class AdminControlledReplyBot:
         message = (
             f"🎯 **Выберите канал для публикации:**\n"
             f"{vk_status}\n\n"
-            f"Нажмите на канал, затем подготовьте пост: текст + несколько фото, планирование или моментальная публикация."
+            f"Нажмите на кнопку с названием канала, затем отправьте текст или фото:"
         )
         
         if not self.check_vk_token() and user_info['is_admin']:
             message += f"\n\n⚠️ Для получения нового токена используйте /get_token"
+        
+        await update.message.reply_text(message, reply_markup=reply_markup)
+    
+    async def show_schedule_menu(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Меню отложенных постов"""
+        user = update.effective_user
+        user_info = self.get_user(user.id)
+        channels = self.get_user_channels(user_info['id'])
+        
+        if not channels:
+            keyboard = [["🔙 Назад в меню"]]
+            reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+            await update.message.reply_text(
+                "❌ У вас нет доступных каналов для отложенной публикации.\n\n"
+                "Обратитесь к администратору для получения доступа.",
+                reply_markup=reply_markup
+            )
+            return
+        
+        # Создаем кнопки для выбора канала
+        keyboard = []
+        for channel in channels:
+            keyboard.append([f"⏰ {channel['name']}"])
+        
+        keyboard.append(["🔙 Назад в меню"])
+        
+        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+        
+        message = (
+            "⏰ **Отложенная публикация**\n\n"
+            "Выберите канал для отложенного поста, затем укажите дату и время публикации.\n\n"
+            "Формат даты: ДД.ММ.ГГГГ ЧЧ:ММ\n"
+            "Пример: 25.12.2024 15:30"
+        )
         
         await update.message.reply_text(message, reply_markup=reply_markup)
     
@@ -1196,20 +858,17 @@ class AdminControlledReplyBot:
         channel = next((ch for ch in channels if ch['name'] == channel_name), None)
         
         if channel:
-            user_info = self.get_user(user.id)
-            self.ensure_post_draft(context, channel, user_info['id'])
-            reply_markup = self.get_post_actions_keyboard()
+            context.user_data['selected_channel'] = channel
+            context.user_data['publish_type'] = 'immediate'
+            keyboard = [["🔙 Назад в меню"]]
+            reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
             
             vk_status = "✅ Будет опубликовано в VK" if self.check_vk_token() else "⚠️ Только в Telegram (VK токен истек)"
             
             message = (
                 f"✅ **Выбран канал:** {channel['name']}\n"
                 f"{vk_status}\n\n"
-                f"Отправьте текст и до {MAX_PHOTOS_PER_POST} фото.\n"
-                f"Когда пост готов, выберите действие:\n"
-                f"• ✅ Опубликовать сейчас\n"
-                f"• 🕒 Отложить пост\n"
-                f"• 🗑️ Очистить пост\n\n"
+                f"Теперь отправьте текст или фото для публикации.\n"
                 f"Пост будет опубликован в:\n"
                 f"• Telegram: {channel['telegram']}\n"
                 f"• VK: {channel['vk_group_id']}"
@@ -1221,6 +880,98 @@ class AdminControlledReplyBot:
             await update.message.reply_text(message, reply_markup=reply_markup)
         else:
             await update.message.reply_text("❌ Канал не найден")
+    
+    async def select_channel_for_scheduling(self, update: Update, context: ContextTypes.DEFAULT_TYPE, channel_name: str):
+        """Выбор канала для отложенного поста"""
+        user = update.effective_user
+        user_info = self.get_user(user.id)
+        channels = self.get_user_channels(user_info['id'])
+        
+        channel = next((ch for ch in channels if ch['name'] == channel_name), None)
+        
+        if channel:
+            context.user_data['selected_channel'] = channel
+            context.user_data['publish_type'] = 'scheduled'
+            context.user_data['schedule_stage'] = 'awaiting_datetime'
+            
+            keyboard = [["🔙 Назад в меню"]]
+            reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+            
+            message = (
+                f"✅ **Выбран канал для отложенного поста:** {channel['name']}\n\n"
+                f"Теперь укажите дату и время публикации в формате:\n"
+                f"**ДД.ММ.ГГГГ ЧЧ:ММ**\n\n"
+                f"Пример: 25.12.2024 15:30\n\n"
+                f"Минимальное время: через 10 минут от текущего момента."
+            )
+            
+            await update.message.reply_text(message, reply_markup=reply_markup)
+        else:
+            await update.message.reply_text("❌ Канал не найден")
+    
+    async def handle_schedule_setup(self, update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
+        """Обработка настройки отложенного поста"""
+        stage = context.user_data['schedule_stage']
+        
+        if stage == 'awaiting_datetime':
+            try:
+                # Парсим дату и время
+                date_str, time_str = text.split()
+                day, month, year = map(int, date_str.split('.'))
+                hour, minute = map(int, time_str.split(':'))
+                
+                scheduled_time = datetime(year, month, day, hour, minute)
+                now = datetime.now()
+                
+                # Проверяем, что время в будущем и не менее чем через 10 минут
+                if scheduled_time <= now + timedelta(minutes=10):
+                    await update.message.reply_text(
+                        "❌ Время должно быть минимум на 10 минут позже текущего момента.\n"
+                        "Попробуйте снова:"
+                    )
+                    return
+                
+                context.user_data['scheduled_time'] = scheduled_time
+                context.user_data['schedule_stage'] = 'awaiting_content'
+                
+                await update.message.reply_text(
+                    f"✅ Время установлено: {scheduled_time.strftime('%d.%m.%Y %H:%M')}\n\n"
+                    f"Теперь отправьте текст или фото для отложенной публикации."
+                )
+                
+            except ValueError:
+                await update.message.reply_text(
+                    "❌ Неверный формат даты и времени.\n"
+                    "Используйте формат: ДД.ММ.ГГГГ ЧЧ:ММ\n"
+                    "Пример: 25.12.2024 15:30\n\n"
+                    "Попробуйте снова:"
+                )
+        
+        elif stage == 'awaiting_content':
+            # Здесь будет обработка контента для отложенного поста
+            # Пока просто сохраняем текст
+            channel = context.user_data['selected_channel']
+            scheduled_time = context.user_data['scheduled_time']
+            
+            # Сохраняем отложенный пост в базу данных
+            conn = sqlite3.connect('bot.db')
+            cursor = conn.cursor()
+            
+            cursor.execute(
+                "INSERT INTO scheduled_posts (user_id, channel_id, message_text, scheduled_time) VALUES (?, ?, ?, ?)",
+                (user_info['id'], channel['id'], text, scheduled_time)
+            )
+            
+            conn.commit()
+            conn.close()
+            
+            # Очищаем временные данные
+            context.user_data.clear()
+            
+            await update.message.reply_text(
+                f"✅ Отложенный пост запланирован на {scheduled_time.strftime('%d.%m.%Y %H:%M')}\n\n"
+                f"Пост будет опубликован в канале: {channel['name']}"
+            )
     
     async def show_my_channels(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Показать каналы пользователя"""
@@ -1242,130 +993,31 @@ class AdminControlledReplyBot:
         
         await update.message.reply_text(message, reply_markup=reply_markup)
     
-    async def show_new_channels(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Показать новые каналы, к которым пользователь получил доступ"""
-        user = update.effective_user
-        user_info = self.get_user(user.id)
-        
-        if not user_info or not user_info['is_approved']:
-            await update.message.reply_text("❌ Доступ запрещен. Ожидайте одобрения администратора.")
-            return
-        
-        # Получаем каналы, к которым пользователь получил доступ недавно
-        query = """
-            SELECT c.name, c.telegram_channel, c.vk_group_id, c.created_at 
-            FROM channels c
-            JOIN user_permissions up ON c.id = up.channel_id
-            WHERE up.user_id = %s AND c.is_active = TRUE
-            ORDER BY c.created_at DESC
-            LIMIT 5
-        """
-        result = self.execute_query(query, (user_info['id'],))
-        
-        if not result:
-            message = "📭 У вас пока нет доступных каналов.\n\nОжидайте одобрения администратора или обратитесь к нему для получения доступа."
-        else:
-            message = "🆕 **Последние добавленные каналы:**\n\n"
-            for channel in result:
-                message += f"• **{channel[0]}**\n"
-                message += f"  📱 TG: {channel[1]}\n"
-                message += f"  👥 VK: {channel[2]}\n"
-                message += f"  📅 Добавлен: {channel[3].strftime('%d.%m.%Y')}\n\n"
-            
-            message += "Для публикации используйте меню: 📢 Опубликовать пост"
-        
-        keyboard = [["🔙 Назад в меню"]]
-        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-        
-        await update.message.reply_text(message, reply_markup=reply_markup)
-    
     async def show_user_management(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Управление пользователями (админ)"""
         pending_users = self.get_pending_users()
         
+        message = "👥 **Управление пользователями**\n\n"
+        
         if not pending_users:
-            message = "✅ Нет пользователей ожидающих одобрения."
-            keyboard = [["🗑️ Удалить пользователя"], ["🔙 Назад в меню"]]
+            message += "✅ Нет пользователей ожидающих одобрения.\n\n"
         else:
-            message = "👥 **Пользователи ожидающие одобрения:**\n\n"
+            message += "⏳ **Пользователи ожидающие одобрения:**\n\n"
             for user in pending_users:
-                message += f"• {user['first_name']} (@{user['username']})\n"
-            
-            message += "\nДля одобрения всех пользователей нажмите кнопку ниже:"
-            keyboard = [
-                ["✅ Одобрить всех пользователей"],
-                ["🗑️ Удалить пользователя"],
-                ["🔙 Назад в меню"]
-            ]
+                message += f"• {user['first_name']} (@{user['username']}) - ID: {user['telegram_id']}\n"
+            message += "\n"
+        
+        message += "Для управления пользователями используйте кнопки ниже:"
+        
+        keyboard = [
+            ["✅ Одобрить всех пользователей"],
+            ["🗑️ Удалить пользователя"],
+            ["🔙 Назад в меню"]
+        ]
         
         reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
         
         await update.message.reply_text(message, reply_markup=reply_markup)
-    
-    async def start_delete_user(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        users = self.execute_query(
-            "SELECT telegram_id, username, first_name FROM users WHERE is_active = TRUE ORDER BY first_name LIMIT 10"
-        )
-        if not users:
-            await update.message.reply_text("❌ Нет активных пользователей для удаления.")
-            return
-        
-        context.user_data['user_delete_stage'] = 'awaiting_user'
-        message = "🗑️ **Удаление пользователя**\n\nОтправьте Telegram ID или username (@username):\n\nПримеры:\n• 123456789\n• @username\n\nПервые пользователи:\n"
-        for user_row in users:
-            display_username = user_row[1] or "нет username"
-            display_name = user_row[2] or "Без имени"
-            message += f"• {display_name} (@{display_username}) — ID {user_row[0]}\n"
-        
-        reply_markup = ReplyKeyboardMarkup([["❌ Отменить удаление пользователя"]], resize_keyboard=True)
-        await update.message.reply_text(message, reply_markup=reply_markup)
-    
-    async def handle_user_delete(self, update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
-        if not context.user_data.get('user_delete_stage'):
-            return
-        
-        target = text.strip()
-        user_row = None
-        
-        if target.isdigit():
-            user_row = self.execute_query(
-                "SELECT id, telegram_id, username, first_name FROM users WHERE telegram_id = %s AND is_active = TRUE",
-                (int(target),)
-            )
-        else:
-            username = target.lstrip('@')
-            user_row = self.execute_query(
-                "SELECT id, telegram_id, username, first_name FROM users WHERE LOWER(username) = LOWER(%s) AND is_active = TRUE",
-                (username,)
-            )
-        
-        if not user_row:
-            await update.message.reply_text("❌ Пользователь не найден или уже удален.")
-            return
-        
-        user_id_db, telegram_id, username, first_name = user_row[0]
-        
-        if telegram_id == update.effective_user.id:
-            await update.message.reply_text("⚠️ Нельзя удалить самого себя.")
-            return
-        
-        self.execute_query(
-            "UPDATE users SET is_active = FALSE, is_admin = FALSE, is_approved = FALSE WHERE id = %s",
-            (user_id_db,)
-        )
-        self.execute_query("DELETE FROM user_permissions WHERE user_id = %s", (user_id_db,))
-        self.execute_query(
-            "UPDATE scheduled_posts SET status = 'cancelled', error = %s WHERE user_id = %s AND status IN ('scheduled', 'processing')",
-            ("Пользователь удален администратором", user_id_db)
-        )
-        context.user_data.pop('user_delete_stage', None)
-        
-        username_display = f"@{username}" if username else "без username"
-        first_name_display = first_name or "Без имени"
-        await update.message.reply_text(
-            f"🗑️ Пользователь {first_name_display} ({username_display}) удален.\nВсе доступы и отложенные посты отменены.",
-            reply_markup=ReplyKeyboardMarkup([["👥 Управление пользователями"], ["🔙 Назад в меню"]], resize_keyboard=True)
-        )
     
     async def approve_all_users(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Одобрить всех ожидающих пользователей"""
@@ -1382,6 +1034,38 @@ class AdminControlledReplyBot:
             reply_markup=reply_markup
         )
     
+    async def start_delete_user(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Начало процесса удаления пользователя"""
+        context.user_data['delete_user_stage'] = 'awaiting_telegram_id'
+        
+        keyboard = [["🔙 Назад в меню"]]
+        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+        
+        await update.message.reply_text(
+            "🗑️ **Удаление пользователя**\n\n"
+            "Введите Telegram ID пользователя для удаления:",
+            reply_markup=reply_markup
+        )
+    
+    async def handle_user_deletion(self, update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
+        """Обработка удаления пользователя"""
+        try:
+            telegram_id = int(text)
+            user_info = self.get_user(telegram_id)
+            
+            if user_info:
+                self.delete_user(telegram_id)
+                context.user_data.clear()
+                
+                await update.message.reply_text(
+                    f"✅ Пользователь {user_info['first_name']} (@{user_info['username']}) удален!"
+                )
+            else:
+                await update.message.reply_text("❌ Пользователь с таким ID не найден.")
+                
+        except ValueError:
+            await update.message.reply_text("❌ Неверный формат ID. Введите числовой Telegram ID.")
+    
     async def show_channel_management(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Управление каналами (админ)"""
         channels = self.get_all_channels()
@@ -1393,145 +1077,83 @@ class AdminControlledReplyBot:
         else:
             message += "📋 **Список ваших каналов:**\n\n"
             for channel in channels:
-                # Получаем количество пользователей с доступом к этому каналу
-                users_count_result = self.execute_query(
-                    "SELECT COUNT(*) FROM user_permissions WHERE channel_id = %s AND can_post = TRUE",
-                    (channel['id'],)
-                )
-                users_count = users_count_result[0][0] if users_count_result else 0
-                
                 message += f"• {channel['name']}\n"
                 message += f"  📱 TG: {channel['telegram']}\n"
-                message += f"  👥 VK: {channel['vk_group_id']}\n"
-                message += f"  👤 Доступно: {users_count} пользователям\n\n"
+                message += f"  👥 VK: {channel['vk_group_id']}\n\n"
         
-        message += "**Действия:**"
+        message += "Для управления каналами используйте кнопки ниже:"
         
         keyboard = [
             ["➕ Добавить канал"],
             ["🗑️ Удалить канал"],
-            ["🔄 Синхронизировать доступ"],
             ["🔙 Назад в меню"]
         ]
         reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
         
         await update.message.reply_text(message, reply_markup=reply_markup)
     
-    async def start_delete_channel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        channels = self.get_all_channels()
-        
-        if not channels:
-            await update.message.reply_text("❌ Нет активных каналов для удаления.")
-            return
-        
-        context.user_data['channel_delete_stage'] = 'awaiting_channel'
-        message = "🗑️ **Удаление канала**\n\nОтправьте ID или точное название канала из списка:\n\n"
-        for channel in channels:
-            message += f"• ID {channel['id']}: {channel['name']} ({channel['telegram']})\n"
-        
-        reply_markup = ReplyKeyboardMarkup([["❌ Отменить удаление канала"]], resize_keyboard=True)
-        await update.message.reply_text(message, reply_markup=reply_markup)
-    
-    async def handle_channel_delete(self, update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
-        if not context.user_data.get('channel_delete_stage'):
-            return
-        
-        target = text.strip()
-        channel_row = None
-        
-        if target.isdigit():
-            result = self.execute_query(
-                "SELECT id, name FROM channels WHERE id = %s AND is_active = TRUE",
-                (int(target),)
-            )
-        else:
-            result = self.execute_query(
-                "SELECT id, name FROM channels WHERE LOWER(name) = LOWER(%s) AND is_active = TRUE",
-                (target,)
-            )
-        
-        if not result:
-            await update.message.reply_text("❌ Канал не найден. Попробуйте снова или отмените действие.")
-            return
-        
-        channel_id, channel_name = result[0]
-        self.execute_query("UPDATE channels SET is_active = FALSE WHERE id = %s", (channel_id,))
-        self.execute_query("DELETE FROM user_permissions WHERE channel_id = %s", (channel_id,))
-        self.execute_query(
-            "UPDATE scheduled_posts SET status = 'cancelled', error = %s WHERE channel_id = %s AND status IN ('scheduled', 'processing')",
-            ("Канал удален администратором", channel_id)
-        )
-        context.user_data.pop('channel_delete_stage', None)
-        
-        await update.message.reply_text(
-            f"🗑️ Канал '{channel_name}' деактивирован. Все запланированные посты отменены.",
-            reply_markup=ReplyKeyboardMarkup([["⚙️ Управление каналами"], ["🔙 Назад в меню"]], resize_keyboard=True)
-        )
-    
-    async def sync_user_access(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Синхронизировать доступ пользователя ко всем каналам"""
-        user = update.effective_user
-        user_info = self.get_user(user.id)
-        
-        if not user_info or not user_info['is_admin']:
-            await update.message.reply_text("❌ Эта команда только для администраторов")
-            return
-        
-        # Получаем всех одобренных пользователей
-        approved_users = self.execute_query("SELECT id FROM users WHERE is_approved = TRUE AND is_active = TRUE")
-        all_channels = self.execute_query("SELECT id FROM channels WHERE is_active = TRUE")
-        
-        if not approved_users or not all_channels:
-            await update.message.reply_text("❌ Нет пользователей или каналов для синхронизации")
-            return
-        
-        synced_count = 0
-        
-        # Для каждого одобренного пользователя даем доступ ко всем каналам
-        for user in approved_users:
-            user_id = user[0]
-            for channel in all_channels:
-                channel_id = channel[0]
-                # Проверяем, есть ли уже доступ
-                existing_access = self.execute_query(
-                    "SELECT 1 FROM user_permissions WHERE user_id = %s AND channel_id = %s",
-                    (user_id, channel_id)
-                )
-                if not existing_access:
-                    self.execute_query(
-                        "INSERT INTO user_permissions (user_id, channel_id, can_post) VALUES (%s, %s, %s)",
-                        (user_id, channel_id, True)
-                    )
-                    synced_count += 1
-        
-        await update.message.reply_text(
-            f"✅ Синхронизация завершена!\n\n"
-            f"• Пользователей: {len(approved_users)}\n"
-            f"• Каналов: {len(all_channels)}\n"
-            f"• Добавлено доступов: {synced_count}\n\n"
-            f"Теперь все одобренные пользователи имеют доступ ко всем каналам."
-        )
-    
     async def start_add_channel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Начало процесса добавления канала"""
         context.user_data['setup_stage'] = 'awaiting_name'
         
-        keyboard = [["❌ Отменить добавление"]]
+        keyboard = [["🔙 Назад в меню"]]
         reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
         
         await update.message.reply_text(
             "📝 **Добавление нового канала**\n\n"
-            "Шаг 1/3: Введите название канала (например: 'Новости компании'):\n\n"
-            "❌ Для отмены нажмите кнопку ниже",
+            "Шаг 1/3: Введите название канала (например: 'Новости компании'):",
             reply_markup=reply_markup
         )
+    
+    async def start_delete_channel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Начало процесса удаления канала"""
+        channels = self.get_all_channels()
+        
+        if not channels:
+            await update.message.reply_text("❌ Нет каналов для удаления.")
+            return
+        
+        context.user_data['delete_channel_stage'] = 'awaiting_channel_name'
+        context.user_data['available_channels'] = channels
+        
+        keyboard = []
+        for channel in channels:
+            keyboard.append([f"🗑️ {channel['name']}"])
+        
+        keyboard.append(["🔙 Назад в меню"])
+        
+        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+        
+        await update.message.reply_text(
+            "🗑️ **Удаление канала**\n\n"
+            "Выберите канал для удаления:",
+            reply_markup=reply_markup
+        )
+    
+    async def handle_channel_deletion(self, update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
+        """Обработка удаления канала"""
+        if text.startswith("🗑️ "):
+            channel_name = text[3:]  # Убираем эмодзи
+            channels = context.user_data['available_channels']
+            
+            channel = next((ch for ch in channels if ch['name'] == channel_name), None)
+            
+            if channel:
+                self.delete_channel(channel['id'])
+                context.user_data.clear()
+                
+                await update.message.reply_text(
+                    f"✅ Канал '{channel_name}' успешно удален!"
+                )
+            else:
+                await update.message.reply_text("❌ Канал не найден.")
     
     async def handle_channel_setup(self, update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
         """Обработка процесса добавления канала"""
         user_data = context.user_data
         stage = user_data['setup_stage']
         
-        keyboard = [["❌ Отменить добавление"]]
+        keyboard = [["🔙 Назад в меню"]]
         reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
         
         if stage == 'awaiting_name':
@@ -1539,8 +1161,7 @@ class AdminControlledReplyBot:
             user_data['setup_stage'] = 'awaiting_telegram'
             await update.message.reply_text(
                 "✅ Название сохранено!\n\n"
-                "Шаг 2/3: Введите username Telegram канала (например: @my_channel):\n\n"
-                "❌ Для отмены нажмите кнопку ниже",
+                "Шаг 2/3: Введите username Telegram канала (например: @my_channel):",
                 reply_markup=reply_markup
             )
             
@@ -1549,70 +1170,126 @@ class AdminControlledReplyBot:
             user_data['setup_stage'] = 'awaiting_vk'
             await update.message.reply_text(
                 "✅ Telegram канал сохранен!\n\n"
-                "Шаг 3/3: Введите ID VK группы (например: -123456789):\n\n"
-                "❌ Для отмены нажмите кнопку ниже",
+                "Шаг 3/3: Введите ID VK группы (например: -123456789):",
                 reply_markup=reply_markup
             )
             
         elif stage == 'awaiting_vk':
             user_data['new_vk_group_id'] = text
             
-            try:
-                user = update.effective_user
-                user_info = self.get_user(user.id)
-                
-                result = self.execute_query(
-                    "INSERT INTO channels (name, telegram_channel, vk_group_id, created_by) VALUES (%s, %s, %s, %s) RETURNING id",
-                    (user_data['new_channel_name'], user_data['new_telegram_channel'], user_data['new_vk_group_id'], user_info['id'])
-                )
-                channel_id = result[0][0] if result else None
-                
-                if channel_id:
-                    channel_name = user_data.get('new_channel_name', 'Новый канал')
-                    # Автоматически даем доступ создателю
-                    self.execute_query(
-                        "INSERT INTO user_permissions (user_id, channel_id, can_post) VALUES (%s, %s, %s) ON CONFLICT (user_id, channel_id) DO UPDATE SET can_post = %s",
-                        (user_info['id'], channel_id, True, True)
-                    )
-                    
-                    # Даем доступ к новому каналу всем одобренным пользователям
-                    self.grant_access_to_all_users(channel_id)
-                    
-                    # Очищаем временные данные
-                    context.user_data.clear()
-                    
-                    # Показываем главное меню после успешного добавления
-                    keyboard = [["🆕 Новые каналы", "📢 Опубликовать пост"], ["🔙 Назад в меню"]]
-                    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-                    
-                    await update.message.reply_text(
-                        f"🎉 Канал '{channel_name}' успешно добавлен!\n\n"
-                        "✅ Все одобренные пользователи автоматически получили доступ к этому каналу.\n\n"
-                        "📢 Вы можете сразу начать публикацию или посмотреть новые каналы:",
-                        reply_markup=reply_markup
-                    )
-                else:
-                    raise Exception("Не удалось получить ID созданного канала")
-                
-            except Exception as e:
-                logger.error(f"❌ Ошибка добавления канала: {e}")
-                await update.message.reply_text(
-                    "❌ Ошибка при добавлении канала. Попробуйте снова.",
-                    reply_markup=reply_markup
-                )
-    
-    async def cancel_setup(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Отмена процесса добавления канала или администратора"""
-        if 'setup_stage' in context.user_data:
-            setup_type = "канала" if 'new_channel_name' in context.user_data else "администратора"
-            context.user_data.clear()
-            await update.message.reply_text(
-                f"❌ Процесс добавления {setup_type} отменен.",
-                reply_markup=ReplyKeyboardRemove()
+            # Сохраняем канал в базу данных
+            conn = sqlite3.connect('bot.db')
+            cursor = conn.cursor()
+            
+            user = update.effective_user
+            user_info = self.get_user(user.id)
+            
+            cursor.execute(
+                "INSERT INTO channels (name, telegram_channel, vk_group_id, created_by) VALUES (?, ?, ?, ?)",
+                (user_data['new_channel_name'], user_data['new_telegram_channel'], user_data['new_vk_group_id'], user_info['id'])
             )
-            await self.show_main_menu(update, context)
+            
+            channel_id = cursor.lastrowid
+            
+            # Автоматически даем доступ создателю
+            cursor.execute(
+                "INSERT OR REPLACE INTO user_permissions (user_id, channel_id, can_post) VALUES (?, ?, ?)",
+                (user_info['id'], channel_id, True)
+            )
+            
+            conn.commit()
+            conn.close()
+            
+            # Даем доступ к новому каналу всем одобренным пользователям
+            self.grant_access_to_all_users(channel_id)
+            
+            # Очищаем временные данные
+            context.user_data.clear()
+            
+            await update.message.reply_text(
+                f"🎉 Канал '{user_data['new_channel_name']}' успешно добавлен!\n\n"
+                "Все одобренные пользователи автоматически получили доступ к этому каналу.",
+                reply_markup=reply_markup
+            )
+    
+    async def admin_management(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Управление администраторами"""
+        user = update.effective_user
+        user_info = self.get_user(user.id)
+        
+        if not user_info or not user_info['is_admin']:
+            await update.message.reply_text("❌ Эта команда только для администраторов")
+            return
+        
+        conn = sqlite3.connect('bot.db')
+        cursor = conn.cursor()
+        
+        cursor.execute("SELECT username, first_name FROM users WHERE is_admin = TRUE")
+        admins = cursor.fetchall()
+        conn.close()
+        
+        message = "👑 **Управление администраторами**\n\n"
+        
+        if not admins:
+            message += "❌ Нет администраторов\n\n"
         else:
-            await update.message.reply_text("❌ Нет активного процесса для отмены.")
+            message += "📋 **Список администраторов:**\n\n"
+            for admin in admins:
+                message += f"• {admin[1]} (@{admin[0]})\n"
+            message += "\n"
+        
+        message += "Для управления администраторами используйте кнопки ниже:"
+        
+        keyboard = [
+            ["➕ Добавить админа"],
+            ["🔙 Назад в меню"]
+        ]
+        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+        
+        await update.message.reply_text(message, reply_markup=reply_markup)
+    
+    async def start_add_admin(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Начало процесса добавления администратора"""
+        context.user_data['add_admin_stage'] = 'awaiting_telegram_id'
+        
+        keyboard = [["🔙 Назад в меню"]]
+        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+        
+        await update.message.reply_text(
+            "👑 **Добавление администратора**\n\n"
+            "Введите Telegram ID пользователя:",
+            reply_markup=reply_markup
+        )
+    
+    async def handle_admin_addition(self, update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
+        """Обработка добавления администратора"""
+        try:
+            telegram_id = int(text)
+            user_info = self.get_user(telegram_id)
+            
+            if user_info:
+                # Обновляем пользователя как администратора
+                conn = sqlite3.connect('bot.db')
+                cursor = conn.cursor()
+                
+                cursor.execute(
+                    "UPDATE users SET is_admin = TRUE, is_approved = TRUE WHERE telegram_id = ?",
+                    (telegram_id,)
+                )
+                
+                conn.commit()
+                conn.close()
+                
+                context.user_data.clear()
+                
+                await update.message.reply_text(
+                    f"✅ Пользователь {user_info['first_name']} (@{user_info['username']}) теперь администратор!"
+                )
+            else:
+                await update.message.reply_text("❌ Пользователь с таким ID не найден.")
+                
+        except ValueError:
+            await update.message.reply_text("❌ Неверный формат ID. Введите числовой Telegram ID.")
     
     async def show_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Показать помощь"""
@@ -1629,26 +1306,33 @@ class AdminControlledReplyBot:
         message += "• /get_token - Получить ссылку для нового VK токена\n"
         
         if user_info['is_admin']:
-            message += "• /update_token - Обновить VK токен (админы)\n\n"
+            message += "• /update_token - Обновить VK токен (админы)\n"
+            message += "• /stop - Остановить бота (админы)\n\n"
         else:
             message += "\n"
         
-        message += "🎯 **Основные функции:**\n"
-        message += "• '📢 Опубликовать пост' - выбрать канал, собрать текст и несколько фото, опубликовать сразу или запланировать\n"
-        message += "• '📋 Мои каналы' - список всех доступных каналов\n"
-        message += "• '🆕 Новые каналы' - показать последние добавленные каналы\n\n"
+        message += "🎯 **Как опубликовать пост:**\n"
+        message += "1. Нажмите '📢 Опубликовать пост'\n"
+        message += "2. Выберите канал из списка\n"
+        message += "3. Отправьте текст или фото\n"
+        message += "4. Пост автоматически опубликуется в Telegram и VK\n\n"
         
-        message += "❌ **Отмена действий:**\n"
-        message += "• Во время добавления канала используйте '❌ Отменить добавление'\n"
-        message += "• При выборе канала для публикации - '🔙 Назад в меню'\n\n"
+        message += "⏰ **Отложенная публикация:**\n"
+        message += "1. Нажмите '⏰ Отложенный пост'\n"
+        message += "2. Выберите канал\n"
+        message += "3. Укажите дату и время в формате ДД.ММ.ГГГГ ЧЧ:ММ\n"
+        message += "4. Отправьте контент для публикации\n\n"
+        
+        message += "📱 **Просмотр каналов:**\n"
+        message += "• '📋 Мои каналы' - список доступных вам каналов\n\n"
         
         if user_info['is_admin']:
             message += "👥 **Функции администратора:**\n"
-            message += "• '👥 Управление пользователями' - одобрение новых пользователей\n"
+            message += "• '👥 Управление пользователями' - одобрение и удаление пользователей\n"
             message += "• '⚙️ Управление каналами' - просмотр, добавление и удаление каналов\n"
-            message += "• '🗑️ Удалить пользователя' - быстро отключить доступ\n"
-            message += "• '🔄 Синхронизировать доступ' - гарантировать доступ ко всем каналам\n"
-            message += "• /update_token - обновление VK токена\n\n"
+            message += "• '👑 Управление админами' - добавление администраторов\n"
+            message += "• /update_token - обновление VK токена\n"
+            message += "• /stop - полная остановка бота\n\n"
         
         message += "❓ **Если у вас нет доступа к каналам или возникли проблемы - обратитесь к администратору.**"
         
@@ -1657,280 +1341,200 @@ class AdminControlledReplyBot:
         
         await update.message.reply_text(message, reply_markup=reply_markup)
     
-    async def request_shutdown(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Запрашиваем подтверждение остановки бота"""
-        user_info = self.get_user(update.effective_user.id)
-        if not user_info or not user_info['is_admin']:
-            await update.message.reply_text("❌ Эта команда доступна только администраторам.")
-            return
-        
-        context.user_data['shutdown_stage'] = 'confirm_shutdown'
-        keyboard = [
-            ["✅ Подтвердить остановку"],
-            ["❌ Отмена остановки"]
-        ]
-        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-        await update.message.reply_text(
-            "⚠️ Вы собираетесь остановить бота.\n\n"
-            "Render автоматически перезапустит сервис, но текущее подключение к Telegram будет завершено.\n\n"
-            "Подтвердите действие:",
-            reply_markup=reply_markup
-        )
-    
-    async def confirm_shutdown(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Подтверждение остановки бота"""
-        context.user_data.pop('shutdown_stage', None)
-        await update.message.reply_text("⏳ Завершаю работу бота...", reply_markup=ReplyKeyboardRemove())
-        await context.application.stop()
-    
     async def handle_photo(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Добавление фото в черновик"""
+        """Публикация фото (одного или нескольких)"""
         user = update.effective_user
         
         if not self.is_user_approved(user.id):
             await update.message.reply_text("❌ Доступ запрещен. Ожидайте одобрения администратора.")
             return
         
-        draft = self.get_post_draft(context)
-        if not draft:
-            await update.message.reply_text("❌ Сначала выберите канал через '📢 Опубликовать пост'.")
+        if 'selected_channel' not in context.user_data:
+            await update.message.reply_text("❌ Сначала выберите канал через меню")
             return
         
-        if len(draft['photos']) >= MAX_PHOTOS_PER_POST:
-            await update.message.reply_text(f"⚠️ Нельзя добавить больше {MAX_PHOTOS_PER_POST} фото.")
+        # Если это медиа группа (несколько фото)
+        if update.message.media_group_id:
+            if 'media_group' not in context.user_data:
+                context.user_data['media_group'] = {
+                    'id': update.message.media_group_id,
+                    'messages': [],
+                    'channel': context.user_data['selected_channel']
+                }
+            
+            context.user_data['media_group']['messages'].append(update.message)
+            
+            # Если это первое сообщение в группе, сообщаем пользователю
+            if len(context.user_data['media_group']['messages']) == 1:
+                await update.message.reply_text("📸 Получена группа медиа. Ожидаю завершения загрузки...")
+            
             return
         
+        # Одиночное фото
+        channel = context.user_data['selected_channel']
         photo = update.message.photo[-1]
-        self.add_photo_to_draft(context, photo.file_id)
-        
-        if caption := (update.message.caption or "").strip():
-            self.append_text_to_draft(context, caption)
-        
-        await update.message.reply_text(
-            f"🖼 Фото добавлено (всего {len(draft['photos'])}).\n"
-            f"Когда закончите, выберите действие ниже.",
-            reply_markup=self.get_post_actions_keyboard()
-        )
-    
-    async def admin_management(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Управление администраторами"""
-        user = update.effective_user
-        user_info = self.get_user(user.id)
-        
-        if not user_info or not user_info['is_admin']:
-            await update.message.reply_text("❌ Эта команда только для администраторов")
-            return
-        
-        # Получаем список всех администраторов
-        admins_result = self.execute_query("SELECT username, first_name FROM users WHERE is_admin = TRUE AND is_active = TRUE")
-        
-        message = "👑 **Управление администраторами**\n\n"
-        
-        if admins_result:
-            message += "📋 **Текущие администраторы:**\n\n"
-            for admin in admins_result:
-                message += f"• {admin[1]} (@{admin[0]})\n"
-            message += "\n"
-        else:
-            message += "❌ Нет администраторов\n\n"
-        
-        message += "Выберите действие:"
-        
-        keyboard = [
-            ["➕ Добавить админа", "👥 Список админов"],
-            ["🔙 Назад в меню"]
-        ]
-        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-        
-        await update.message.reply_text(message, reply_markup=reply_markup)
-
-    async def show_admins_list(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Показать список администраторов"""
-        user = update.effective_user
-        user_info = self.get_user(user.id)
-        
-        if not user_info or not user_info['is_admin']:
-            await update.message.reply_text("❌ Эта команда только для администраторов")
-            return
-        
-        result = self.execute_query("SELECT username, first_name FROM users WHERE is_admin = TRUE AND is_active = TRUE")
-        
-        if not result:
-            message = "❌ Нет администраторов"
-        else:
-            message = "👑 Список администраторов:\n\n"
-            for admin in result:
-                message += f"• {admin[1]} (@{admin[0]})\n"
-        
-        keyboard = [["🔙 Назад в меню"]]
-        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-        
-        await update.message.reply_text(message, reply_markup=reply_markup)
-
-    async def start_add_admin(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Начало процесса добавления администратора"""
-        user = update.effective_user
-        user_info = self.get_user(user.id)
-        
-        if not user_info or not user_info['is_admin']:
-            await update.message.reply_text("❌ Эта команда только для администраторов")
-            return
-        
-        context.user_data['setup_stage'] = 'awaiting_admin_telegram_id'
-        
-        keyboard = [["❌ Отменить добавление"]]
-        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-        
-        await update.message.reply_text(
-            "👑 **Добавление администратора**\n\n"
-            "Введите Telegram ID пользователя (только цифры):\n\n"
-            "❌ Для отмены нажмите кнопку ниже",
-            reply_markup=reply_markup
-        )
-
-    async def handle_admin_setup(self, update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
-        """Обработка процесса добавления администратора"""
-        user_data = context.user_data
-        stage = user_data['setup_stage']
-        
-        keyboard = [["❌ Отменить добавление"]]
-        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-        
-        if stage == 'awaiting_admin_telegram_id':
-            # Проверяем, что введены только цифры
-            if not text.isdigit():
-                await update.message.reply_text(
-                    "❌ Неверный формат Telegram ID!\n\n"
-                    "Telegram ID должен содержать только цифры.\n"
-                    "Попробуйте снова:",
-                    reply_markup=reply_markup
-                )
-                return
-            
-            telegram_id = int(text)
-            
-            # Проверяем, не пытаемся ли добавить себя
-            if telegram_id == update.effective_user.id:
-                await update.message.reply_text(
-                    "❌ Вы не можете добавить сами себя!\n\n"
-                    "Вы уже являетесь администратором.",
-                    reply_markup=reply_markup
-                )
-                context.user_data.clear()
-                await self.show_main_menu(update, context)
-                return
-            
-            # Проверяем, существует ли пользователь
-            target_user = self.get_user(telegram_id)
-            if not target_user:
-                await update.message.reply_text(
-                    "❌ Пользователь не найден!\n\n"
-                    "Пользователь с таким Telegram ID еще не зарегистрирован в боте.\n"
-                    "Попросите пользователя сначала написать /start боту, затем попробуйте снова.",
-                    reply_markup=reply_markup
-                )
-                context.user_data.clear()
-                await self.show_main_menu(update, context)
-                return
-            
-            # Проверяем, не является ли пользователь уже администратором
-            if target_user['is_admin']:
-                await update.message.reply_text(
-                    f"❌ Пользователь {target_user['first_name']} (@{target_user['username']}) уже является администратором!",
-                    reply_markup=reply_markup
-                )
-                context.user_data.clear()
-                await self.show_main_menu(update, context)
-                return
-            
-            # Сохраняем данные и запрашиваем подтверждение
-            user_data['new_admin_telegram_id'] = telegram_id
-            user_data['new_admin_username'] = target_user['username']
-            user_data['new_admin_first_name'] = target_user['first_name']
-            user_data['setup_stage'] = 'confirm_admin_addition'
-            
-            keyboard = [
-                ["✅ Да, сделать администратором"],
-                ["❌ Нет, отменить"]
-            ]
-            reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-            
-            await update.message.reply_text(
-                f"👑 **Подтверждение добавления администратора**\n\n"
-                f"Вы собираетесь назначить администратором:\n"
-                f"• Имя: {target_user['first_name']}\n"
-                f"• Username: @{target_user['username']}\n"
-                f"• Telegram ID: {telegram_id}\n\n"
-                f"Это даст пользователю полный доступ ко всем функциям бота.\n\n"
-                f"Подтвердите действие:",
-                reply_markup=reply_markup
-            )
-
-    async def complete_admin_addition(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Завершение процесса добавления администратора"""
-        user_data = context.user_data
+        caption = update.message.caption or ""
         
         try:
-            telegram_id = user_data['new_admin_telegram_id']
-            username = user_data['new_admin_username']
-            first_name = user_data['new_admin_first_name']
+            # Скачиваем фото
+            photo_file = await photo.get_file()
+            photo_bytes = await photo_file.download_as_bytearray()
             
-            # Назначаем пользователя администратором
-            result = self.execute_query(
-                "UPDATE users SET is_admin = TRUE, is_approved = TRUE WHERE telegram_id = %s",
-                (telegram_id,)
+            # Публикуем в Telegram
+            await context.bot.send_photo(
+                chat_id=channel['telegram'],
+                photo=InputFile(BytesIO(photo_bytes), filename='photo.jpg'),
+                caption=caption
             )
             
-            if result:
-                # Даем доступ ко всем каналам
-                self.approve_user(telegram_id)
-                
-                # Очищаем временные данные
-                context.user_data.clear()
-                
-                await update.message.reply_text(
-                    f"🎉 Пользователь {first_name} (@{username}) успешно назначен администратором!\n\n"
-                    f"✅ Пользователь получил:\n"
-                    f"• Права администратора\n"
-                    f"• Доступ ко всем каналам\n"
-                    f"• Возможность управлять ботом",
-                    reply_markup=ReplyKeyboardRemove()
-                )
-                
-                # Показываем главное меню
-                await self.show_main_menu(update, context)
-            else:
-                await update.message.reply_text(
-                    "❌ Ошибка при назначении администратора. Пользователь не найден.",
-                    reply_markup=ReplyKeyboardRemove()
-                )
-                await self.show_main_menu(update, context)
-                
+            # Публикуем в VK (если доступно)
+            vk_status = await self.publish_to_vk(channel, caption, [photo_bytes])
+            
+            await update.message.reply_text(f"✅ Фото опубликовано в: {channel['name']}\n{vk_status}")
+            
+            # Очищаем выбранный канал после публикации
+            context.user_data.pop('selected_channel', None)
+            
         except Exception as e:
-            logger.error(f"❌ Ошибка добавления администратора: {e}")
-            await update.message.reply_text(
-                "❌ Ошибка при добавлении администратора. Попробуйте снова.",
-                reply_markup=ReplyKeyboardRemove()
+            logger.error(f"Ошибка публикации фото: {e}")
+            await update.message.reply_text(f"❌ Ошибка: {e}")
+    
+    async def publish_multiple_photos(self, update: Update, context: ContextTypes.DEFAULT_TYPE, caption: str = ""):
+        """Публикация нескольких фото"""
+        if 'media_group' not in context.user_data:
+            return
+        
+        media_group = context.user_data['media_group']
+        channel = media_group['channel']
+        
+        try:
+            # Собираем все фото
+            photo_bytes_list = []
+            for msg in media_group['messages']:
+                if msg.photo:
+                    photo = msg.photo[-1]
+                    photo_file = await photo.get_file()
+                    photo_bytes = await photo_file.download_as_bytearray()
+                    photo_bytes_list.append(photo_bytes)
+            
+            # Публикуем в Telegram (первое фото с caption, остальные без)
+            if photo_bytes_list:
+                # Первое фото
+                await context.bot.send_photo(
+                    chat_id=channel['telegram'],
+                    photo=InputFile(BytesIO(photo_bytes_list[0]), filename='photo1.jpg'),
+                    caption=caption
+                )
+                
+                # Остальные фото
+                for i, photo_bytes in enumerate(photo_bytes_list[1:], 2):
+                    await context.bot.send_photo(
+                        chat_id=channel['telegram'],
+                        photo=InputFile(BytesIO(photo_bytes), filename=f'photo{i}.jpg')
+                    )
+            
+            # Публикуем в VK (если доступно)
+            vk_status = await self.publish_to_vk(channel, caption, photo_bytes_list)
+            
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=f"✅ {len(photo_bytes_list)} фото опубликовано в: {channel['name']}\n{vk_status}"
             )
-            await self.show_main_menu(update, context)
+            
+            # Очищаем временные данные
+            context.user_data.pop('media_group', None)
+            context.user_data.pop('selected_channel', None)
+            
+        except Exception as e:
+            logger.error(f"Ошибка публикации нескольких фото: {e}")
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text=f"❌ Ошибка публикации: {e}"
+            )
+    
+    async def publish_to_vk(self, channel, caption, photo_bytes_list):
+        """Публикация в VK"""
+        if not self.check_vk_token():
+            return "⚠️ VK недоступен (токен истек)"
+        
+        try:
+            attachments = []
+            
+            # Загружаем фото в VK
+            for photo_bytes in photo_bytes_list:
+                photo_info = self.vk_upload.photo_wall(
+                    photos=BytesIO(photo_bytes), 
+                    group_id=channel['vk_group_id'].lstrip('-')
+                )[0]
+                attachments.append(f"photo{photo_info['owner_id']}_{photo_info['id']}")
+            
+            # Публикуем пост
+            self.vk_api.wall.post(
+                owner_id=channel['vk_group_id'],
+                message=caption,
+                attachments=",".join(attachments)
+            )
+            return "✅ Опубликовано в VK"
+            
+        except Exception as e:
+            logger.error(f"Ошибка публикации в VK: {e}")
+            return f"❌ Ошибка VK: {str(e)[:100]}"
+    
+    async def publish_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
+        """Публикация текста"""
+        # Если есть медиа группа, публикуем ее с текстом как подписью
+        if 'media_group' in context.user_data:
+            await self.publish_multiple_photos(update, context, text)
+            return
+        
+        channel = context.user_data['selected_channel']
+        user = update.effective_user
+        
+        try:
+            # Публикуем в Telegram
+            await context.bot.send_message(
+                chat_id=channel['telegram'],
+                text=text
+            )
+            
+            # Публикуем в VK (если доступно)
+            vk_status = await self.publish_to_vk(channel, text, [])
+            
+            await update.message.reply_text(f"✅ Опубликовано в: {channel['name']}\n{vk_status}")
+            
+            # Очищаем выбранный канал после публикации
+            context.user_data.pop('selected_channel', None)
+            
+        except Exception as e:
+            logger.error(f"Ошибка публикации: {e}")
+            await update.message.reply_text(f"❌ Ошибка: {e}")
     
     async def status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Показать статус подключений"""
         vk_status = "✅ Работает" if self.check_vk_token() else "❌ Истек/Невалиден"
         tg_status = "✅ Работает"
+        is_render = os.getenv('RENDER')
+        platform = "🚀 Render.com" if is_render else "💻 Локальный сервер"
         
         message = (
             f"📊 **Статус бота**\n\n"
-            f"Платформа: 🚀 Render.com\n"
+            f"Платформа: {platform}\n"
             f"Telegram API: {tg_status}\n"
             f"VK API: {vk_status}\n\n"
         )
         
         if not self.check_vk_token():
-            message += self.get_vk_token_message()
+            user = update.effective_user
+            user_info = self.get_user(user.id)
+            if user_info and user_info['is_admin']:
+                message += self.get_vk_token_message()
+            else:
+                message += "❌ VK недоступен. Обратитесь к администратору."
         else:
             message += "Все системы работают нормально! 🚀"
-            message += "\n\n⚠️ **На Render.com токен хранится в памяти**\nПри перезапуске сервиса потребуется обновить токен снова."
+            
+            if is_render:
+                message += "\n\n⚠️ **На Render.com токен хранится в памяти**\nПри перезапуске сервиса потребуется обновить токен снова."
 
         await update.message.reply_text(message)
     
@@ -1945,45 +1549,37 @@ class AdminControlledReplyBot:
         
         await update.message.reply_text(self.get_vk_token_message())
     
-    def run_with_retry(self, max_retries=3, initial_delay=10):
-        """Запуск бота с повторными попытками при конфликте"""
-        self.acquire_leader_lock()
-        retries = 0
-        delay = initial_delay
+    async def stop_bot(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Остановка бота"""
+        user = update.effective_user
+        user_info = self.get_user(user.id)
+        
+        if not user_info or not user_info['is_admin']:
+            await update.message.reply_text("❌ Эта команда только для администраторов")
+            return
+        
+        await update.message.reply_text(
+            "🛑 **Остановка бота...**\n\n"
+            "Бот будет остановлен. Для повторного запуска необходимо перезапустить приложение на Render.com.",
+            reply_markup=ReplyKeyboardRemove()
+        )
+        
+        logger.info("Бот остановлен администратором")
+        # Останавливаем приложение
+        os._exit(0)
+    
+    def run(self):
+        """Запуск бота"""
+        is_render = os.getenv('RENDER')
+        platform = "Render.com" if is_render else "локальном сервере"
+        logger.info(f"Бот запущен на {platform}...")
         
         try:
-            while retries < max_retries:
-                try:
-                    logger.info(f"🚀 Запуск бота на Render.com (попытка {retries + 1}/{max_retries})...")
-                    
-                    self.tg_app.run_polling(
-                        drop_pending_updates=True,
-                        allowed_updates=None,
-                        close_loop=False
-                    )
-                    break
-                    
-                except Exception as e:
-                    retries += 1
-                    error_msg = str(e)
-                    
-                    if "Conflict" in error_msg or "terminated by other getUpdates" in error_msg:
-                        logger.warning(f"🔄 Конфликт Telegram getUpdates, повтор через {delay} сек...")
-                        time.sleep(delay)
-                        delay *= 2
-                    else:
-                        logger.error(f"❌ Критическая ошибка: {error_msg}")
-                        break
-                    
-                    if retries >= max_retries:
-                        logger.error("❌ Достигнут лимит попыток запуска")
-                        break
-        finally:
-            self.release_leader_lock()
+            self.tg_app.run_polling()
+        except Exception as e:
+            logger.error(f"Ошибка при запуске бота: {e}")
+            raise
 
 if __name__ == "__main__":
-    # Даем время завершиться предыдущему процессу
-    time.sleep(5)
     bot = AdminControlledReplyBot()
-    bot.run_with_retry(max_retries=3, initial_delay=10)
-
+    bot.run()
