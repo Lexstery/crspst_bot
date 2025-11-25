@@ -202,13 +202,14 @@ class AdminControlledReplyBot:
             else:
                 cursor.execute(query)
             
+            is_select = query.lstrip().upper().startswith('SELECT')
             has_result = cursor.description is not None
             
-            if has_result:
+            if is_select:
                 result = cursor.fetchall()
             else:
+                result = cursor.fetchall() if has_result else cursor.rowcount
                 conn.commit()
-                result = cursor.rowcount
             
             return result
             
@@ -1506,6 +1507,7 @@ class AdminControlledReplyBot:
                 channel_id = result[0][0] if result else None
                 
                 if channel_id:
+                    channel_name = user_data.get('new_channel_name', 'Новый канал')
                     # Автоматически даем доступ создателю
                     self.execute_query(
                         "INSERT INTO user_permissions (user_id, channel_id, can_post) VALUES (%s, %s, %s) ON CONFLICT (user_id, channel_id) DO UPDATE SET can_post = %s",
@@ -1523,7 +1525,7 @@ class AdminControlledReplyBot:
                     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
                     
                     await update.message.reply_text(
-                        f"🎉 Канал '{user_data['new_channel_name']}' успешно добавлен!\n\n"
+                        f"🎉 Канал '{channel_name}' успешно добавлен!\n\n"
                         "✅ Все одобренные пользователи автоматически получили доступ к этому каналу.\n\n"
                         "📢 Вы можете сразу начать публикацию или посмотреть новые каналы:",
                         reply_markup=reply_markup
