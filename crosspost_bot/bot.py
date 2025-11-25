@@ -25,7 +25,10 @@ if __package__ in {None, ""}:
 
     sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
+from zoneinfo import ZoneInfo
+
 from crosspost_bot.config import Settings
+UTC = ZoneInfo("UTC")
 from crosspost_bot.database import Database
 from crosspost_bot.keyboards import (
     admin_main_keyboard,
@@ -108,6 +111,15 @@ def get_main_keyboard(user: dict) -> ReplyKeyboardMarkup:
     if user.get("is_admin"):
         return admin_main_keyboard()
     return user_main_keyboard()
+
+
+def get_local_timezone(context: ContextTypes.DEFAULT_TYPE) -> ZoneInfo:
+    settings: Settings = context.application.bot_data["settings"]
+    try:
+        return ZoneInfo(settings.timezone)
+    except Exception:
+        LOGGER.warning("Invalid TIMEZONE %s, falling back to UTC", settings.timezone)
+        return UTC
 
 
 async def ensure_user(
@@ -408,6 +420,9 @@ async def show_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "- Затем отправьте текст, одиночное фото или медиагруппу (несколько фото подряд).\n"
         "- При отложенной публикации дополнительно выберите дату и время в формате ДД.ММ.ГГГГ ЧЧ:ММ.\n"
         "- Бот автоматически публикует материалы в выбранном Telegram канале и связанном VK сообществе.\n\n"
+        "🕒 Часовой пояс:\n"
+        "- Время планирования интерпретируется в зоне TIMEZONE (по умолчанию Europe/Moscow).\n"
+        "- Измените переменную окружения TIMEZONE, если работаете в другом регионе.\n\n"
         "5️⃣ Управление VK токеном:\n"
         "- /get_token выдаёт ссылку авторизации VK.\n"
         "- После получения токена используйте /update_token.\n"
@@ -548,16 +563,16 @@ async def process_schedule_time(
         await update.message.reply_text("Сначала выберите дату.")
         return
     try:
-        scheduled_datetime = datetime.strptime(
-            f"{date_str} {text}", "%d.%m.%Y %H:%M"
-        )
+        scheduled_datetime = datetime.strptime(f"{date_str} {text}", "%d.%m.%Y %H:%M")
     except ValueError:
         await update.message.reply_text("Неверный формат времени.")
         return
-    pending["scheduled_for"] = scheduled_datetime
+    local_tz = get_local_timezone(context)
+    localized = scheduled_datetime.replace(tzinfo=local_tz)
+    pending["scheduled_for"] = localized.astimezone(UTC)
     context.user_data["state"] = STATE_SCHEDULE_CONTENT
     await update.message.reply_text(
-        f"Пост будет опубликован {scheduled_datetime}. "
+        f"Пост будет опубликован {localized.strftime('%d.%m.%Y %H:%M')} ({local_tz.key}). "
         "Отправьте контент (текст и/или фото).",
         reply_markup=cancel_keyboard(),
     )
@@ -579,7 +594,7 @@ async def process_schedule_content(
     if not scheduled_for:
         await update.message.reply_text("Не указана дата и время.")
         return
-    if scheduled_for < datetime.now():
+    if scheduled_for < datetime.now(UTC):
         await update.message.reply_text("Дата должна быть в будущем.")
         return
     if not text and not media:
@@ -593,10 +608,10 @@ async def process_schedule_content(
         media=media,
         scheduled_for=scheduled_for,
     )
+    local_time = scheduled_for.astimezone(get_local_timezone(context))
     await update.message.reply_text(
-        f"Пост запланирован на {scheduled_for}.", reply_markup=get_main_keyboard(
-            await db.get_user(update.effective_user.id)
-        )
+        f"Пост запланирован на {local_time.strftime('%d.%m.%Y %H:%M')} ({local_time.tzinfo.key}).",
+        reply_markup=get_main_keyboard(await db.get_user(update.effective_user.id)),
     )
     context.user_data.clear()
     context.user_data["state"] = STATE_IDLE
