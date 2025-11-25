@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
-from io import BytesIO
+import tempfile
 from typing import Iterable, Optional
 
 import vk_api
@@ -64,21 +65,30 @@ class VKClient:
         owner_id = self._normalize_group_id(group_id)
         attachments: list[str] = []
         if photo_files:
-            buffers = []
-            for idx, (filename, data) in enumerate(photo_files):
-                buffer = BytesIO(data)
-                buffer.name = filename or f"photo_{idx}.jpg"
-                buffer.seek(0)
-                buffers.append(buffer)
+            temp_files = []
             try:
-                uploaded = self._upload.photo_wall(
-                    photos=buffers, group_id=abs(owner_id)
-                )
-                for photo in uploaded:
-                    attachments.append(f"photo{photo['owner_id']}_{photo['id']}")
-            except vk_api.ApiError as exc:
-                LOGGER.exception("Failed to upload VK photo: %s", exc)
-                raise
+                for idx, (filename, data) in enumerate(photo_files):
+                    suffix = os.path.splitext(filename or "photo.jpg")[1] or ".jpg"
+                    with tempfile.NamedTemporaryFile(
+                        delete=False, suffix=suffix, prefix=f"vk_upload_{idx}_"
+                    ) as tmp:
+                        tmp.write(data)
+                        temp_files.append(tmp.name)
+                try:
+                    uploaded = self._upload.photo_wall(
+                        photos=temp_files, group_id=abs(owner_id)
+                    )
+                    for photo in uploaded:
+                        attachments.append(f"photo{photo['owner_id']}_{photo['id']}")
+                except vk_api.ApiError as exc:
+                    LOGGER.exception("Failed to upload VK photo: %s", exc)
+                    raise
+            finally:
+                for tmp_path in temp_files:
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
         try:
             response = self._api.wall.post(
                 owner_id=owner_id,
