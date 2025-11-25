@@ -19,9 +19,9 @@ from telegram.ext import (
     filters,
 )
 
-from .config import Settings
-from .database import Database
-from .keyboards import (
+from crosspost_bot.config import Settings
+from crosspost_bot.database import Database
+from crosspost_bot.keyboards import (
     admin_main_keyboard,
     cancel_keyboard,
     channel_management_keyboard,
@@ -32,8 +32,8 @@ from .keyboards import (
     schedule_time_keyboard,
     user_main_keyboard,
 )
-from .scheduler import ScheduledPostWorker
-from .services.vk_client import VKClient, extract_token_from_url
+from crosspost_bot.scheduler import ScheduledPostWorker
+from crosspost_bot.services.vk_client import VKClient, extract_token_from_url
 
 logging.basicConfig(
     level=logging.INFO,
