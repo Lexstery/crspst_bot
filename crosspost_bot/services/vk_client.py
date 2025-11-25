@@ -65,13 +65,14 @@ class VKClient:
         attachments: list[str] = []
         if photo_files:
             buffers = []
-            for filename, data in photo_files:
+            for idx, (filename, data) in enumerate(photo_files):
                 buffer = BytesIO(data)
-                buffer.name = filename
+                buffer.name = filename or f"photo_{idx}.jpg"
+                buffer.seek(0)
                 buffers.append(buffer)
             try:
                 uploaded = self._upload.photo_wall(
-                    photo_files=buffers, group_id=abs(owner_id)
+                    photos=buffers, group_id=abs(owner_id)
                 )
                 for photo in uploaded:
                     attachments.append(f"photo{photo['owner_id']}_{photo['id']}")
