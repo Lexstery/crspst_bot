@@ -78,7 +78,7 @@ def manage_admins_keyboard(users: Iterable[dict]) -> ReplyKeyboardMarkup:
             row = []
     if row:
         rows.append(row)
-    rows.append(["⬅️ Назад"])
+    rows.append(["➕ Добавить по ID", "⬅️ Назад"])
     return build_keyboard(rows)
 
 
@@ -90,7 +90,7 @@ def channel_management_keyboard() -> ReplyKeyboardMarkup:
     return build_keyboard(rows)
 
 
-def schedule_date_keyboard(days: int = 30) -> ReplyKeyboardMarkup:
+def schedule_date_keyboard(days: int = 5) -> ReplyKeyboardMarkup:
     today = datetime.now()
     rows: list[list[str]] = []
     row: list[str] = []
@@ -121,6 +121,5 @@ def schedule_time_keyboard(step_minutes: int = 30) -> ReplyKeyboardMarkup:
         rows.append(row)
     rows.append(["⬅️ Назад"])
     return build_keyboard(rows)
-
 
 
