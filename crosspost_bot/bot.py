@@ -68,6 +68,7 @@ ALBUM_CACHE_KEY = "album_cache"
 ALBUM_FLUSH_DELAY = 1.0
 STATE_MANAGE_USERS = "manage_users"
 STATE_MANAGE_ADMINS = "manage_admins"
+STATE_ADMIN_ADD = "admin_add"
 STATE_TOKEN_UPDATE = "token_update"
 
 
@@ -338,7 +339,16 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     elif state == STATE_MANAGE_USERS:
         await finalize_user_approval(update, context, text)
     elif state == STATE_MANAGE_ADMINS:
-        await finalize_admin_toggle(update, context, text)
+        if text == "➕ Добавить по ID":
+            context.user_data["state"] = STATE_ADMIN_ADD
+            await update.message.reply_text(
+                "Укажите Telegram ID пользователя, которого нужно назначить администратором.",
+                reply_markup=cancel_keyboard(),
+            )
+        else:
+            await finalize_admin_toggle(update, context, text)
+    elif state == STATE_ADMIN_ADD:
+        await finalize_admin_add(update, context, text)
     elif state == STATE_TOKEN_UPDATE:
         await finalize_token_update(update, context, text)
     else:
@@ -732,7 +742,8 @@ async def start_admin_management(
     users = await db.list_users()
     context.user_data["state"] = STATE_MANAGE_ADMINS
     await update.message.reply_text(
-        "Выберите пользователя для переключения прав администратора.",
+        "Выберите пользователя для переключения прав администратора "
+        "или воспользуйтесь кнопкой '➕ Добавить по ID'.",
         reply_markup=manage_admins_keyboard(users),
     )
 
@@ -760,6 +771,26 @@ async def finalize_admin_toggle(
         f"Пользователь {telegram_id} теперь "
         f"{'администратор' if not user['is_admin'] else 'пользователь'}."
     )
+    context.user_data["state"] = STATE_IDLE
+
+
+async def finalize_admin_add(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, text: str
+) -> None:
+    db: Database = context.application.bot_data["db"]
+    try:
+        telegram_id = int(text)
+    except ValueError:
+        await update.message.reply_text("Введите числовой Telegram ID пользователя.")
+        return
+    user = await db.get_user(telegram_id)
+    if not user:
+        user = await db.upsert_user(telegram_id, None, None, None)
+        LOGGER.info("Создан новый пользователь %s для назначения админом.", telegram_id)
+    await db.approve_user(telegram_id, True)
+    await db.set_admin(telegram_id, True)
+    await db.grant_all_channels(telegram_id)
+    await update.message.reply_text(f"Пользователь {telegram_id} назначен администратором.")
     context.user_data["state"] = STATE_IDLE
 
 
